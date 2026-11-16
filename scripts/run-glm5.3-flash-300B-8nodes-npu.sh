@@ -17,7 +17,7 @@ NODE_IPS=(197.13.21.1 197.13.22.1 197.13.23.1 197.13.24.1
           197.13.25.1 197.13.26.1 197.13.27.1 197.13.28.1)
 LOG_ROOT="${LOG_ROOT:-${DEPS_ROOT}/cache/work/glm53-eight-node}"
 HF_CHECKPOINT="${HF_CHECKPOINT:-/mnt/weight/GLM-5.3-Flash-BF16}"
-PROMPT_DATA="${PROMPT_DATA:-/mnt/share/l00804615/datasets/DAPO-Math-17k-original-65877096-full8-7b849e/train-original-glm53-format.jsonl}"
+PROMPT_DATA="${PROMPT_DATA:-${DEPS_ROOT%/*}/datasets/dapo-math-17k/dapo-math-17k.jsonl}"
 NUM_ROLLOUT="${NUM_ROLLOUT:-1000}"
 CP_SIZE="${CP_SIZE:-8}"
 [[ $CP_SIZE == 8 || $CP_SIZE == 16 ]] || { echo "CP_SIZE must be 8 or 16" >&2; exit 2; }

@@ -2,7 +2,8 @@
 
 The sparse indices already encode causality and packed-sequence boundaries.
 Use sparse_mode=0 in both directions, preserving duplicate selected slots.
-CANN 9.2 KV-merge (value=None) returns dK+dV in d_key and an empty d_value.
+CANN 9.2 A3 KV-merge (value=None) returns dK+dV in d_key and an empty d_value.
+Ascend950 requires an explicit value tensor and summing d_key and d_value.
 A3 requires 64 auxiliary RoPE channels. Real keys have zero RoPE, preserving
 no-RoPE model scores. Padding maps to a pool of zero KVs with large negative auxiliary scores,
 because the A3 backward kernel cannot consume -1 indices. Distributing padding
@@ -36,6 +37,15 @@ class _SparseFlashAttention(torch.autograd.Function):
         with torch.npu.device(q.device):
             query = q.contiguous()
             selected = indices.to(torch.int32).contiguous()
+            separate_value = torch.npu.get_device_name(q.device.index).startswith("Ascend950")
+            if separate_value:
+                # CANN's Ascend950 backward accepts 1024-slot widths up to 8192.
+                # Mask added slots in both directions so softmax and its saved
+                # statistics describe the same selections, including duplicates.
+                width = selected.shape[-1]
+                if width > 8192:
+                    raise ValueError("Ascend950 SparseFlashAttention supports at most 8192 selections")
+                selected = F.pad(selected, (0, (-width) % 1024), value=-1)
             nonempty = selected[..., :1].ge(0)
             selected = torch.cat((torch.where(nonempty, selected[..., :1], 0), selected[..., 1:]), -1)
             # S2 must be strictly greater than K: otherwise A3 backward selects
@@ -58,7 +68,7 @@ class _SparseFlashAttention(torch.autograd.Function):
             q_lengths = torch.tensor([query.shape[0]], dtype=torch.int32, device=q.device)
             kv_lengths = torch.tensor([tokens], dtype=torch.int32, device=q.device)
             output, softmax_max, softmax_sum = torch_npu.npu_sparse_flash_attention(
-                query, shared, None, selected, float(scaling),
+                query, shared, shared if separate_value else None, selected, float(scaling),
                 query_rope=q_rope, key_rope=k_rope,
                 actual_seq_lengths_query=q_lengths, actual_seq_lengths_kv=kv_lengths,
                 sparse_block_size=1, layout_query="TND", layout_kv="TND",
@@ -68,6 +78,7 @@ class _SparseFlashAttention(torch.autograd.Function):
                                   q_rope, k_rope, q_lengths, kv_lengths, nonempty)
             ctx.scaling = float(scaling)
             ctx.kv_tokens = kv.shape[0]
+            ctx.separate_value = separate_value
             return torch.where(nonempty, output, 0)
 
     @staticmethod
@@ -76,11 +87,15 @@ class _SparseFlashAttention(torch.autograd.Function):
         with torch.npu.device(q.device):
             upstream = torch.where(nonempty, dout, 0).contiguous()
             dq, dkv, dv, *_ = torch_npu.npu_sparse_flash_attention_grad(
-                q, kv, None, selected, upstream, output, maximum, total, ctx.scaling, 1,
+                q, kv, kv if ctx.separate_value else None, selected, upstream, output, maximum, total, ctx.scaling, 1,
                 query_rope=qr, key_rope=kr, actual_seq_qlen=ql, actual_seq_kvlen=kl,
                 layout="TND", sparse_mode=0, attention_mode=2,
             )
-            if dv.numel() != 0:
+            if ctx.separate_value:
+                # Ascend950 does not merge dV into dK when value is omitted.
+                # The model shares K and V, so both gradients belong to kv.
+                dkv = dkv + dv
+            elif dv.numel() != 0:
                 raise RuntimeError("SparseFlashAttention KV-merge must return an empty d_value")
             return dq, dkv[:ctx.kv_tokens], None, None
 
