@@ -9,6 +9,7 @@ because the A3 backward kernel cannot consume -1 indices. Distributing padding
 indices avoids the measured slowdown from repeatedly selecting one sentinel.
 """
 import math
+import os
 
 import torch
 import torch.nn.functional as F
@@ -36,6 +37,13 @@ class _SparseFlashAttention(torch.autograd.Function):
         with torch.npu.device(q.device):
             query = q.contiguous()
             selected = indices.to(torch.int32).contiguous()
+            if (
+                os.getenv("GLM53_LOGP_PARITY_ONLY") == "1"
+                and torch.npu.get_device_name(q.device.index).startswith("Ascend950")
+            ):
+                padding = (-selected.shape[-1]) % 1024
+                if padding:
+                    selected = F.pad(selected, (0, padding), value=-1)
             nonempty = selected[..., :1].ge(0)
             selected = torch.cat((torch.where(nonempty, selected[..., :1], 0), selected[..., 1:]), -1)
             # S2 must be strictly greater than K: otherwise A3 backward selects

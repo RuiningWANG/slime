@@ -1,4 +1,5 @@
 import logging
+import os
 
 import ray
 
@@ -29,6 +30,14 @@ def train(args, pgs, rollout_manager, num_rollout_per_epoch, restore_plan):
 
     if args.offload_rollout:
         ray.get(rollout_manager.onload_kv.remote())
+
+    if os.getenv("GLM53_BATCH_REPORT"):
+        from slime.rollout.glm53_batch_gate import check
+
+        engines = ray.get(rollout_manager.get_updatable_engines_and_lock.remote())[0]
+        if len(engines) != 1:
+            raise RuntimeError(f"GLM53 batch gate expects one rollout engine, got {len(engines)}")
+        check(ray.get(engines[0].get_url.remote()))
 
     # special case for eval-only
     if args.num_rollout == 0 and args.eval_interval is not None:

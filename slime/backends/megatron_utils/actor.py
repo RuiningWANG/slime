@@ -491,6 +491,7 @@ class MegatronTrainRayActor(TrainRayActor):
                     and self.args.kl_coef == 0
                     and not self.args.use_rollout_logprobs
                     and not self.args.get_mismatch_metrics
+                    and self.rollout_data_postprocess is None
                     and not self.args.use_critic
                     and not self.args.use_opd
                     and (not self.args.use_routing_replay or self.args.use_rollout_routing_replay)
@@ -537,6 +538,13 @@ class MegatronTrainRayActor(TrainRayActor):
                 self.args,
                 rollout_data,
             )
+
+            if os.getenv("GLM53_LOGP_PARITY_ONLY") == "1":
+                if self.rollout_data_postprocess is None:
+                    raise RuntimeError("GLM53_LOGP_PARITY_ONLY requires rollout data postprocessing")
+                if self.args.use_routing_replay:
+                    RoutingReplay.clear_all()
+                return
 
             # Train
             if self.args.use_routing_replay:

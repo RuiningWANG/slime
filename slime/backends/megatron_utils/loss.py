@@ -1,3 +1,4 @@
+import os
 from argparse import Namespace
 from collections.abc import Callable, Iterator
 from typing import Any
@@ -610,6 +611,23 @@ def get_log_probs_and_entropy(
     )
 
     res = {"log_probs": log_probs_list}
+
+    if os.getenv("GLM53_LOGP_PARITY_ONLY") == "1" and not torch.is_grad_enabled():
+        assert torch.distributed.get_world_size(tp_group) == 1
+        assert args.context_parallel_size == 1 and top_p_keep_mask is None
+        from batch_invariant_ops import npu_log_softmax_batch_invariant
+
+        from_sglang_norm = []
+        for row_logits, token_ids in zip(logits.split(128), full_tokens.reshape(-1, 1).split(128), strict=True):
+            normalized = npu_log_softmax_batch_invariant(row_logits, -1)
+            from_sglang_norm.append(normalized.gather(-1, token_ids).squeeze(-1))
+        res["sglang_norm_log_probs"], _ = _extract_per_sample(
+            torch.cat(from_sglang_norm),
+            None,
+            total_lengths,
+            response_lengths,
+            args.allgather_cp,
+        )
     if with_entropy:
         res["entropy"] = entropy_list
 
