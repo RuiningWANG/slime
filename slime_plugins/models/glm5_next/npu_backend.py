@@ -127,6 +127,18 @@ class FusedRMSNormGated(torch.nn.Module):
         self.eps = eps
 
     def forward(self, x, gate):
+        if os.getenv("GLM53_TRAIN_ROLLOUT_PARITY") != "1":
+            return self._native_forward(x, gate)
+
+        from sglang.kernels.ops.attention.fla.fused_norm_gate import rms_norm_gated
+
+        with torch.no_grad():
+            serving = rms_norm_gated(x, gate, self.weight, None, activation="sigmoid", eps=self.eps)
+        if torch.is_grad_enabled() and any(t.requires_grad for t in (x, gate, self.weight)):
+            return ServingValue.apply(self._native_forward(x, gate), serving)
+        return serving
+
+    def _native_forward(self, x, gate):
         normalized = x.float() * torch.rsqrt(x.float().square().mean(-1, keepdim=True) + self.eps)
         return (normalized * self.weight.float() * gate.float().sigmoid()).to(x.dtype)
 
@@ -182,3 +194,94 @@ class SparseMLA:
         from .ascendc_smla import SparseMLA as AscendCSparseMLA
 
         return AscendCSparseMLA.apply(q, kv, indices, scaling)
+
+
+class ServingValue(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, native, serving):
+        return serving
+
+    @staticmethod
+    def backward(ctx, gradient):
+        return gradient, None
+
+
+def project_and_convolve_for_serving(module, hidden, cu, cu_cpu, cp_context):
+    names = ("q", "k", "v")
+    convolutions = [getattr(module, f"{name}_conv1d") for name in names]
+    projections = [getattr(module, f"{name}_proj") for name in names]
+    if cp_context is not None or hidden.device.type != "npu" or hidden.dtype != torch.bfloat16:
+        raise RuntimeError("Shared KDA inputs require BF16 NPU training with CP=1")
+
+    qkv = [projection(hidden) for projection in projections]
+    beta = module.b_proj(hidden)
+    forget = module.f_b_proj(module.f_a_proj(hidden))
+    norm_gate = module.g_b_proj(module.g_a_proj(hidden))
+
+    if torch.is_grad_enabled() and any(
+        x.requires_grad or conv.weight.requires_grad for x, conv in zip(qkv, convolutions, strict=True)
+    ):
+        native = [conv(x, cu_seqlens=cu)[0] for x, conv in zip(qkv, convolutions, strict=True)]
+    else:
+        native = None
+
+    from sgl_kernel_npu.mamba.causal_conv1d import causal_conv1d_fn_native
+
+    bounds = _boundaries(cu_cpu if cu_cpu is not None else cu, hidden.shape[1])
+    with torch.no_grad():
+        weight = torch.cat([conv.weight.squeeze(1) for conv in convolutions])
+        mixed = torch.cat(qkv, dim=-1)
+        outputs = [
+            causal_conv1d_fn_native(
+                mixed[:, begin:end].transpose(1, 2).contiguous(), weight, activation="silu"
+            )[0].transpose(1, 2)
+            for begin, end in zip(bounds[:-1], bounds[1:], strict=True) if begin < end
+        ]
+        convolved = torch.cat(outputs, dim=1).split([x.shape[-1] for x in qkv], dim=-1)
+    if native is not None:
+        convolved = [
+            ServingValue.apply(original, output.contiguous())
+            for original, output in zip(native, convolved, strict=True)
+        ]
+
+    qkv = [x.unflatten(-1, (module.heads, module.head_dim)) for x in convolved]
+    return qkv, forget.unflatten(-1, (module.heads, module.head_dim)), beta, norm_gate
+
+
+def serving_chunk_kda(q, k, v, *, g, beta, raw_beta, cu_seqlens, cp_context=None, **kwargs):
+    if q.device.type != "npu" or q.shape[0] != 1 or cp_context is not None:
+        raise RuntimeError("Shared KDA requires an NPU packed batch with CP=1")
+    cpu_bounds = kwargs.get("cu_seqlens_cpu")
+    bounds = _boundaries(cpu_bounds if cpu_bounds is not None else cu_seqlens, q.shape[1])
+    if bounds[0] != 0 or bounds[-1] != q.shape[1]:
+        raise ValueError("Packed KDA boundaries must cover the complete input")
+    a_log = kwargs["A_log"]
+    dt_bias = kwargs["dt_bias"]
+    from sglang.srt.layers.attention.linear.kernels.kda_triton import TritonKDAKernel
+
+    with torch.no_grad():
+        kernel = TritonKDAKernel()
+        state = torch.zeros((2, v.shape[2], v.shape[3], k.shape[3]),
+                            device=q.device, dtype=torch.float32)
+        slot = torch.tensor([1], device=q.device, dtype=torch.int32)
+        pieces = []
+        for begin, end in zip(bounds[:-1], bounds[1:], strict=True):
+            if begin == end:
+                continue
+            state.zero_()
+            pieces.append(kernel.decode(
+                q=q[:, begin:end].contiguous(), k=k[:, begin:end].contiguous(),
+                v=v[:, begin:end].contiguous(), a=g[:, begin:end].contiguous(),
+                b=raw_beta[:, begin:end].contiguous(), A_log=a_log,
+                dt_bias=dt_bias, ssm_states=state, cache_indices=slot,
+                query_start_loc=torch.tensor([0, end - begin], device=q.device, dtype=torch.int32),
+                lower_bound=kwargs["lower_bound"],
+            ))
+        serving = torch.cat(pieces, dim=1) if pieces else v.new_empty(v.shape)
+        if serving.shape != v.shape or serving.dtype != v.dtype:
+            raise RuntimeError(f"Unexpected shared KDA output {serving.shape} {serving.dtype}")
+
+    if torch.is_grad_enabled() and any(x.requires_grad for x in (q, k, v, g, beta, a_log, dt_bias)):
+        native, _ = chunk_kda(q, k, v, g=g, beta=beta, cu_seqlens=cu_seqlens, cp_context=cp_context, **kwargs)
+        serving = ServingValue.apply(native, serving)
+    return serving, None

@@ -7,6 +7,8 @@ Importing this module never imports ``torch_npu``. The runtime bootstrap in
 from __future__ import annotations
 
 import importlib
+import logging
+import os
 
 from typing import Any
 
@@ -46,6 +48,13 @@ class NPUAccelerator(TorchAccelerator):
 
     def post_import_torch(self) -> None:
         """Load the optional Ascend Megatron adapter after torch_npu bootstrap."""
+        if os.getenv("GLM53_TRAIN_ROLLOUT_PARITY") == "1":
+            module = self._module()
+            module.set_deterministic_level(3)
+            level = module._get_deterministic_level()
+            if level != 3:
+                raise RuntimeError(f"Expected NPU deterministic level 3, got {level}")
+            logging.getLogger(__name__).info("GLM53 NPU deterministic level %s", level)
         try:
             importlib.import_module("megatron_adaptor")
         except ModuleNotFoundError as exc:

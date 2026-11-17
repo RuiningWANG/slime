@@ -2,6 +2,7 @@
 
 import copy
 import os
+from functools import partial
 
 import torch
 from megatron.core.extensions.transformer_engine_spec_provider import TESpecProvider
@@ -9,6 +10,7 @@ from megatron.core.models.gpt.gpt_layer_specs import get_gpt_decoder_block_spec,
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_layer import TransformerLayer, get_transformer_layer_offset
 
+from slime.utils import accelerator
 from slime.utils.model_config import load_hf_config
 
 from .attention import KimiDeltaAttention, NopeDSAttention
@@ -104,6 +106,10 @@ def get_glm5_next_spec(args, config, vp_stage):
     offset = get_transformer_layer_offset(config, vp_stage=vp_stage)
     kda_layers = set(hf_config.linear_attn_config["kda_layers"])
     backend = Glm5NextSpecProvider()
+    align_moe = accelerator.device_type() == "npu" and os.getenv("GLM53_TRAIN_ROLLOUT_PARITY") == "1"
+    if align_moe:
+        from .moe_parity import Glm5NextAlignedMoELayer
+
     for index, layer in enumerate(spec.layer_specs):
         layer = copy.deepcopy(layer)
         layer.module = Glm5NextLayer
@@ -119,5 +125,10 @@ def get_glm5_next_spec(args, config, vp_stage):
             moe_grouped_gemm=config.moe_grouped_gemm,
             use_te_activation_func=True,
         )
+        if align_moe and index + offset >= hf_config.first_k_dense_replace:
+            moe_builder = layer.submodules.mlp
+            if not isinstance(moe_builder, partial):
+                raise TypeError("GLM5-next aligned MoE requires a partial Megatron MoE builder")
+            layer.submodules.mlp = partial(Glm5NextAlignedMoELayer, *moe_builder.args, **moe_builder.keywords)
         spec.layer_specs[index] = layer
     return spec
