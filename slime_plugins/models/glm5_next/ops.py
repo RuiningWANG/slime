@@ -22,6 +22,17 @@ def swiglu_with_limit(x, limit):
     backend = os.environ.get("GLM53_SWIGLU_BACKEND", "torch")
     if backend not in ("torch", "ascendc"):
         raise ValueError(f"Unsupported GLM53_SWIGLU_BACKEND: {backend}")
+    if (
+        x.device.type == "npu"
+        and x.dtype == torch.bfloat16
+        and x.numel()
+        and os.getenv("GLM53_TRAIN_ROLLOUT_PARITY") == "1"
+    ):
+        import torch_npu
+
+        gate, up = x.chunk(2, dim=-1)
+        clamped = torch.cat((gate.clamp(max=limit), up.clamp(-limit, limit)), dim=-1)
+        return torch_npu.npu_swiglu(clamped)
     gate, up = x.float().chunk(2, dim=-1)
     gate = gate.clamp(max=limit)
     up = up.clamp(-limit, limit)
