@@ -1,6 +1,7 @@
 # Adapt from https://github.com/OpenRLHF/OpenRLHF/blob/10c733694ed9fbb78a0a2ff6a05efc7401584d46/openrlhf/models/utils.py
 # and https://github.com/OpenRLHF/OpenRLHF/blob/10c733694ed9fbb78a0a2ff6a05efc7401584d46/openrlhf/trainer/ppo_utils/experience_maker.py
 
+import os
 from argparse import Namespace
 
 import torch
@@ -527,7 +528,29 @@ def _calculate_log_probs_and_entropy_chunk(
     )
     if not with_entropy:
         entropy = None
-    return log_prob, entropy
+    if (
+        logits.device.type != "npu"
+        or os.getenv("GLM53_TRAIN_ROLLOUT_PARITY") != "1"
+        or _get_vocab_parallel_rank_size(tp_group)[1] != 1
+    ):
+        return log_prob, entropy
+    from sglang.srt.hardware_backend.npu.batch_invariant_ops.npu_batch_invariant_ops import (
+        npu_log_softmax_batch_invariant,
+    )
+    from slime_plugins.models.glm5_next.npu_backend import ServingValue
+
+    with torch.no_grad():
+        targets = tokens.reshape(-1, 1)
+        score_logits = logits.float()
+        if log_prob_keep_mask is not None:
+            allowed = score_logits.masked_fill(~log_prob_keep_mask, float("-inf"))
+            allowed.scatter_(1, targets, score_logits.gather(1, targets))
+            score_logits = allowed
+        serving = npu_log_softmax_batch_invariant(score_logits, dim=-1, _half_to_float=False)
+        selected = serving.gather(1, targets).reshape_as(log_prob)
+    if log_prob.requires_grad:
+        selected = ServingValue.apply(log_prob, selected)
+    return selected, entropy
 
 
 def get_grpo_returns(
