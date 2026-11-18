@@ -1,9 +1,10 @@
 """GLM-5.3 Flash KDA and no-RoPE MLA with pooled DSA indexing."""
 
+import os
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import os
 
 from megatron.core.tensor_parallel.mappings import gather_from_sequence_parallel_region
 from slime.utils import accelerator
@@ -79,31 +80,36 @@ class KimiDeltaAttention(nn.Module):
         if self.cp_group is not None and self.cp_group.size() > 1:
             # --allgather-cp partitions the packed stream into contiguous intervals.
             cp_context = build_cp_context(cu, self.cp_group, conv1d_kernel_size=self.q_conv1d.kernel_size[0])
-        qkv = []
-        for name in ("q", "k", "v"):
-            projected = getattr(self, f"{name}_proj")(x)
-            conv = getattr(self, f"{name}_conv1d")
-            if cp_context is None:
-                convolved, _ = conv(projected, cu_seqlens=cu)
-            else:
-                convolved, _ = causal_conv1d(
-                    projected, conv.weight.squeeze(1), activation=conv.activation, cp_context=cp_context
-                )
-            qkv.append(convolved.unflatten(-1, (self.heads, self.head_dim)))
-        gate = self.f_b_proj(self.f_a_proj(x)).unflatten(-1, (self.heads, self.head_dim))
-        beta_logits = self.b_proj(x)
+        use_serving_kda = x.device.type == "npu" and os.getenv("GLM53_TRAIN_ROLLOUT_PARITY") == "1"
+        if use_serving_kda:
+            from .npu_backend import project_and_convolve_for_serving, serving_chunk_kda
+
+            cpu_bounds = getattr(packed_seq_params, "cu_seqlens_q_cpu", None)
+            qkv, gate, beta_logits, norm_gate = project_and_convolve_for_serving(self, x, cu, cpu_bounds, cp_context)
+            kda = serving_chunk_kda
+            beta_args = {"raw_beta": beta_logits}
+        else:
+            qkv = []
+            for name in ("q", "k", "v"):
+                projected = getattr(self, f"{name}_proj")(x)
+                conv = getattr(self, f"{name}_conv1d")
+                if cp_context is None:
+                    convolved, _ = conv(projected, cu_seqlens=cu)
+                else:
+                    convolved, _ = causal_conv1d(
+                        projected, conv.weight.squeeze(1), activation=conv.activation, cp_context=cp_context
+                    )
+                qkv.append(convolved.unflatten(-1, (self.heads, self.head_dim)))
+            gate = self.f_b_proj(self.f_a_proj(x)).unflatten(-1, (self.heads, self.head_dim))
+            beta_logits = self.b_proj(x)
+            kda = chunk_kda
+            beta_args = {}
         # Ascend inference computes beta sigmoid in FP32 in prefill and decode.
         beta = (
             beta_logits.float().sigmoid()
             if x.device.type == "npu"
             else beta_logits.sigmoid()
         )
-        use_serving_kda = x.device.type == "npu" and os.getenv("GLM53_TRAIN_ROLLOUT_PARITY") == "1"
-        kda = chunk_kda
-        if use_serving_kda:
-            from .npu_backend import serving_chunk_kda
-
-            kda = serving_chunk_kda
         output, _ = kda(
             *qkv,
             g=gate,
@@ -116,11 +122,13 @@ class KimiDeltaAttention(nn.Module):
             dt_bias=self.dt_bias,
             cu_seqlens=cu,
             cp_context=cp_context,
-            **({"raw_beta": beta_logits} if use_serving_kda else {}),
+            **beta_args,
             **({"cu_seqlens_cpu": getattr(packed_seq_params, "cu_seqlens_q_cpu", None)}
                if accelerator.device_type() == "npu" else {}),
         )
-        output_gate = self.g_b_proj(self.g_a_proj(x)).reshape(-1, self.head_dim)
+        if not use_serving_kda:
+            norm_gate = self.g_b_proj(self.g_a_proj(x))
+        output_gate = norm_gate.reshape(-1, self.head_dim)
         output = self.o_norm(output.reshape(-1, self.head_dim), output_gate).reshape(
             *x.shape[:-1], self.heads * self.head_dim
         )
