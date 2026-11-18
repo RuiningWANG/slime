@@ -127,6 +127,18 @@ class FusedRMSNormGated(torch.nn.Module):
         self.eps = eps
 
     def forward(self, x, gate):
+        if os.getenv("GLM53_TRAIN_ROLLOUT_PARITY") != "1":
+            return self._native_forward(x, gate)
+
+        from sglang.kernels.ops.attention.fla.fused_norm_gate import rms_norm_gated
+
+        with torch.no_grad():
+            serving = rms_norm_gated(x, gate, self.weight, None, activation="sigmoid", eps=self.eps)
+        if torch.is_grad_enabled() and any(t.requires_grad for t in (x, gate, self.weight)):
+            return ServingValue.apply(self._native_forward(x, gate), serving)
+        return serving
+
+    def _native_forward(self, x, gate):
         normalized = x.float() * torch.rsqrt(x.float().square().mean(-1, keepdim=True) + self.eps)
         return (normalized * self.weight.float() * gate.float().sigmoid()).to(x.dtype)
 
