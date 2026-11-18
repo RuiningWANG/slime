@@ -125,6 +125,20 @@ def get_glm5_next_spec(args, config, vp_stage):
             moe_grouped_gemm=config.moe_grouped_gemm,
             use_te_activation_func=True,
         )
+        if (
+            accelerator.device_type() == "npu"
+            and os.getenv("GLM53_STRICT_DENSE_PROJECT") == "1"
+            and index + offset < hf_config.first_k_dense_replace
+        ):
+            from dataclasses import replace
+
+            from .dense_projection import AlignedTERowParallelLinear
+
+            dense_builder = layer.submodules.mlp
+            if not isinstance(dense_builder, partial):
+                raise TypeError("GLM5-next aligned dense MLP requires a partial Megatron builder")
+            submodules = replace(dense_builder.keywords["submodules"], linear_fc2=AlignedTERowParallelLinear)
+            layer.submodules.mlp = partial(dense_builder, submodules=submodules)
         if align_moe and index + offset >= hf_config.first_k_dense_replace:
             moe_builder = layer.submodules.mlp
             if not isinstance(moe_builder, partial):
