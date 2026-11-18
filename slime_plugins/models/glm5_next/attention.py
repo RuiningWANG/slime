@@ -136,6 +136,11 @@ class KimiDeltaAttention(nn.Module):
         output = self.o_norm(output.reshape(-1, self.head_dim), output_gate).reshape(
             *x.shape[:-1], self.heads * self.head_dim
         )
+        if os.getenv("GLM53_STRICT_KDA_PROJECT") == "1":
+            from .projection_parity import training_projection
+
+            projected = training_projection(self.o_proj, output)
+            return projected.transpose(0, 1).contiguous(), None
         return self.o_proj(output).transpose(0, 1).contiguous(), None
 
 
@@ -236,4 +241,9 @@ class NopeDSAttention(nn.Module):
             # Preserve the original GPU SparseMLA 512+64 layout.
             out, _ = SparseMLA.apply(F.pad(q, (0, 64)), F.pad(kv[:, None], (0, 64)), indices, self.qk_dim**-0.5)
         out = torch.bmm(out.transpose(0, 1), wv.transpose(1, 2)).transpose(0, 1)
+        if os.getenv("GLM53_STRICT_MLA_PROJECT") == "1":
+            from .projection_parity import training_projection
+
+            projected = training_projection(self.o_proj, out.flatten(1))
+            return projected.unsqueeze(1), None
         return self.o_proj(out.flatten(1)).unsqueeze(1), None
