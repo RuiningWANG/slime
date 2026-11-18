@@ -98,7 +98,13 @@ class KimiDeltaAttention(nn.Module):
             if x.device.type == "npu"
             else beta_logits.sigmoid()
         )
-        output, _ = chunk_kda(
+        use_serving_kda = x.device.type == "npu" and os.getenv("GLM53_TRAIN_ROLLOUT_PARITY") == "1"
+        kda = chunk_kda
+        if use_serving_kda:
+            from .npu_backend import serving_chunk_kda
+
+            kda = serving_chunk_kda
+        output, _ = kda(
             *qkv,
             g=gate,
             beta=beta,
@@ -110,6 +116,7 @@ class KimiDeltaAttention(nn.Module):
             dt_bias=self.dt_bias,
             cu_seqlens=cu,
             cp_context=cp_context,
+            **({"raw_beta": beta_logits} if use_serving_kda else {}),
             **({"cu_seqlens_cpu": getattr(packed_seq_params, "cu_seqlens_q_cpu", None)}
                if accelerator.device_type() == "npu" else {}),
         )
