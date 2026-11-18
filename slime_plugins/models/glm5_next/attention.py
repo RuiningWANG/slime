@@ -36,6 +36,10 @@ class RMSNorm(nn.Module):
         self.eps = eps
 
     def forward(self, x):
+        if x.device.type == "npu" and x.dtype == torch.bfloat16 and os.getenv("GLM53_TRAIN_ROLLOUT_PARITY") == "1":
+            import torch_npu
+
+            return torch_npu.npu_rms_norm(x, self.weight, self.eps)[0]
         normalized = x.float() * torch.rsqrt(x.float().square().mean(-1, keepdim=True) + self.eps)
         return (normalized * self.weight.float()).to(x.dtype)
 
