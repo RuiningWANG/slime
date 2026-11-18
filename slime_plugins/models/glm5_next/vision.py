@@ -1,5 +1,7 @@
 """Checkpoint-compatible CogViT using the Transformers GLM-OCR building blocks."""
 
+import os
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -49,9 +51,18 @@ class Glm5NextVisionBlock(GlmOcrVisionBlock):
         if hidden_states.device.type == "npu":
             import torch_npu
 
-            normalized, _, residual = torch_npu.npu_add_rms_norm(
-                hidden_states, attention, self.norm2.weight, self.norm2.eps
-            )
+            if os.getenv("GLM53_TRAIN_ROLLOUT_PARITY") == "1":
+                from sglang.srt.hardware_backend.npu.batch_invariant_ops.npu_batch_invariant_ops import (
+                    npu_add_rms_norm_batch_invariant,
+                )
+
+                normalized, _, residual = npu_add_rms_norm_batch_invariant(
+                    hidden_states, attention, self.norm2.weight, self.norm2.eps
+                )
+            else:
+                normalized, _, residual = torch_npu.npu_add_rms_norm(
+                    hidden_states, attention, self.norm2.weight, self.norm2.eps
+                )
             return residual + self.mlp(normalized)
         # Match the fused residual-add/RMSNorm: normalize the FP32 sum,
         # while the residual branch itself is stored in the model dtype.
