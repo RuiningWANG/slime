@@ -1,5 +1,7 @@
 """Use SGLang's BF16 NPU MoE forward with live partitioned trainer weights."""
 
+import os
+
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
@@ -39,6 +41,47 @@ def swiglu(x, limit):
     return torch_npu.npu_swiglu(torch.cat((gate.clamp(max=limit), up.clamp(-limit, limit)), dim=-1))
 
 
+def eight_shard_moe(
+    layer, x, permuted, expanded, counts, probabilities, ids,
+    *, expert_weights, grouped_linear, swiglu,
+):
+    from sglang.srt.hardware_backend.npu.glm53_parity import ordered_shard_sum, projection_shard
+
+    experts = layer.experts
+    ep = layer.ep_group
+    num_local_experts = layer.num_local_experts
+    w1 = expert_weights(experts.linear_fc1, ep, num_local_experts, x.dtype)
+    w2 = expert_weights(experts.linear_fc2, ep, num_local_experts, x.dtype)
+    gate, up = w1.chunk(2, dim=1)
+
+    shared = layer.shared_experts
+    shared_gate, shared_up = shared.linear_fc1.weight.chunk(2, dim=0)
+    shared_down = shared.linear_fc2.weight
+    if gate.shape[1] != w2.shape[2] or shared_gate.shape[0] != shared_down.shape[1]:
+        raise ValueError("The MoE gate/up weights and down projection have different widths")
+    if gate.shape[1] % 8 or shared_down.shape[1] % 8:
+        raise ValueError("The MoE intermediate width must divide evenly into eight ranks")
+
+    limit = layer.config.activation_func_clamp_value
+    scale = layer.config.moe_router_topk_scaling_factor
+    finalize = NPUFinalizeRouting(drop_pad_mode=2)
+    mixtures = []
+    for g, u, w, sg, su, sd in zip(
+        gate.chunk(8, dim=1), up.chunk(8, dim=1), w2.chunk(8, dim=2),
+        shared_gate.chunk(8, dim=0), shared_up.chunk(8, dim=0), shared_down.chunk(8, dim=1),
+        strict=True,
+    ):
+        gate_up = grouped_linear(permuted, torch.cat((g, u), dim=1), counts)
+        expert_out = grouped_linear(swiglu(gate_up, limit), w.contiguous(), counts)
+        routed = finalize._finalize_routing(
+            expert_out, probabilities.to(x.dtype), expanded, ids,
+        )
+        shared_up_out = projection_shard(x, torch.cat((sg, su), dim=0))
+        shared_out = projection_shard(swiglu(shared_up_out, limit), sd)
+        mixtures.append(routed * scale + shared_out)
+    return ordered_shard_sum(tuple(mixtures))
+
+
 @torch.no_grad()
 def serving_forward(layer, hidden_states):
     config = layer.config
@@ -62,6 +105,12 @@ def serving_forward(layer, hidden_states):
     permuted, expanded, counts, _ = NPUMoEInitRouting_v2()._init_routing(
         x, ids, config.num_moe_experts, k
     )
+    if os.getenv("GLM53_STRICT_MOE_PROJECT") == "1":
+        return eight_shard_moe(
+            layer, x, permuted, expanded, counts, probabilities, ids,
+            expert_weights=all_expert_weights, grouped_linear=grouped_linear, swiglu=swiglu,
+        ).reshape_as(hidden_states)
+
     experts = layer.experts
     gate_up = grouped_linear(
         permuted, all_expert_weights(experts.linear_fc1, ep, local_experts, x.dtype), counts
