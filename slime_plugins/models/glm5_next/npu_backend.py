@@ -260,23 +260,36 @@ def serving_chunk_kda(q, k, v, *, g, beta, raw_beta, cu_seqlens, cp_context=None
 
     with torch.no_grad():
         kernel = TritonKDAKernel()
-        state = torch.zeros((2, v.shape[2], v.shape[3], k.shape[3]),
-                            device=q.device, dtype=torch.float32)
-        slot = torch.tensor([1], device=q.device, dtype=torch.int32)
-        pieces = []
-        for begin, end in zip(bounds[:-1], bounds[1:], strict=True):
-            if begin == end:
-                continue
-            state.zero_()
-            pieces.append(kernel.decode(
-                q=q[:, begin:end].contiguous(), k=k[:, begin:end].contiguous(),
-                v=v[:, begin:end].contiguous(), a=g[:, begin:end].contiguous(),
-                b=raw_beta[:, begin:end].contiguous(), A_log=a_log,
-                dt_bias=dt_bias, ssm_states=state, cache_indices=slot,
-                query_start_loc=torch.tensor([0, end - begin], device=q.device, dtype=torch.int32),
+        if os.getenv("GLM53_KDA_GROUPED_RECURRENCE") == "1":
+            count = len(bounds) - 1
+            state = torch.zeros((count + 1, v.shape[2], v.shape[3], k.shape[3]),
+                                device=q.device, dtype=torch.float32)
+            serving = kernel.decode(
+                q=q.contiguous(), k=k.contiguous(), v=v.contiguous(),
+                a=g.contiguous(), b=raw_beta.contiguous(), A_log=a_log,
+                dt_bias=dt_bias, ssm_states=state,
+                cache_indices=torch.arange(1, count + 1, device=q.device, dtype=torch.int32),
+                query_start_loc=torch.tensor(bounds, device=q.device, dtype=torch.int32),
                 lower_bound=kwargs["lower_bound"],
-            ))
-        serving = torch.cat(pieces, dim=1) if pieces else v.new_empty(v.shape)
+            ) if q.shape[1] else v.new_empty(v.shape)
+        else:
+            state = torch.zeros((2, v.shape[2], v.shape[3], k.shape[3]),
+                                device=q.device, dtype=torch.float32)
+            slot = torch.tensor([1], device=q.device, dtype=torch.int32)
+            pieces = []
+            for begin, end in zip(bounds[:-1], bounds[1:], strict=True):
+                if begin == end:
+                    continue
+                state.zero_()
+                pieces.append(kernel.decode(
+                    q=q[:, begin:end].contiguous(), k=k[:, begin:end].contiguous(),
+                    v=v[:, begin:end].contiguous(), a=g[:, begin:end].contiguous(),
+                    b=raw_beta[:, begin:end].contiguous(), A_log=a_log,
+                    dt_bias=dt_bias, ssm_states=state, cache_indices=slot,
+                    query_start_loc=torch.tensor([0, end - begin], device=q.device, dtype=torch.int32),
+                    lower_bound=kwargs["lower_bound"],
+                ))
+            serving = torch.cat(pieces, dim=1) if pieces else v.new_empty(v.shape)
         if serving.shape != v.shape or serving.dtype != v.dtype:
             raise RuntimeError(f"Unexpected shared KDA output {serving.shape} {serving.dtype}")
 
