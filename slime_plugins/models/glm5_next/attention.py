@@ -161,6 +161,20 @@ class PooledIndexer(nn.Module):
 
     @torch.no_grad()
     def forward(self, x, q, packed_seq_params, cp_group):
+        if (
+            os.getenv("GLM53_STRICT_INDEXER") == "1"
+            and x.device.type == "npu"
+            and x.dtype == torch.bfloat16
+            and (cp_group is None or cp_group.size() == 1)
+        ):
+            from .indexer_parity import serving_indexer
+            from .npu_backend import _boundaries
+
+            cpu_bounds = getattr(packed_seq_params, "cu_seqlens_q_cpu", None)
+            bounds = _boundaries(
+                cpu_bounds if cpu_bounds is not None else packed_seq_params.cu_seqlens_q, x.shape[0]
+            )
+            return serving_indexer(self, x, q, bounds)
         # MLA-noPE also disables indexer RoPE. The checkpoint already uses
         # SGLang/HF's channel order, so no half-channel permutation is needed.
         index_q = self.wq_b(q).view(-1, self.heads, self.dim)
