@@ -250,7 +250,16 @@ class NopeDSAttention(nn.Module):
         indices = self.indexer(x, q_latent, packed_seq_params, self.cp_group)
         if q.device.type == "npu":
             # CANN no-RoPE MLA takes the absorbed 512-channel tensors directly.
-            out, _ = SparseMLA.apply(q, kv[:, None], indices, self.qk_dim**-0.5)
+            if os.getenv("GLM53_STRICT_SPARSE_ATTENTION") == "1":
+                from .sparse_parity import training_sparse_attention
+
+                out, _ = training_sparse_attention(
+                    q, kv[:, None], indices, self.qk_dim**-0.5, packed_seq_params,
+                    self.cp_group, self.indexer.topk + self.indexer.pool_size - 1,
+                    native=SparseMLA.apply,
+                )
+            else:
+                out, _ = SparseMLA.apply(q, kv[:, None], indices, self.qk_dim**-0.5)
         else:
             # Preserve the original GPU SparseMLA 512+64 layout.
             out, _ = SparseMLA.apply(F.pad(q, (0, 64)), F.pad(kv[:, None], (0, 64)), indices, self.qk_dim**-0.5)
