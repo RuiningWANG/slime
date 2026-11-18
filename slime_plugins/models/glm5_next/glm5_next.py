@@ -88,8 +88,28 @@ class Glm5NextLayer(TransformerLayer):
                 output = output + bias
             hidden_states = mhc_post(output, hidden_states, post, residual)
         if self.layer_number == self.config.num_layers:
-            hidden_states = hidden_states.unflatten(-1, (config.hc_mult, -1)).float().mean(-2).to(hidden_states.dtype)
+            if hidden_states.device.type == "npu" and os.getenv("GLM53_STRICT_FINAL_MEAN") == "1":
+                hidden_states = final_stream_mean(hidden_states, config.hc_mult)
+            else:
+                hidden_states = hidden_states.unflatten(-1, (config.hc_mult, -1)).float().mean(-2).to(hidden_states.dtype)
         return hidden_states, context
+
+
+def final_stream_mean(hidden_states, streams):
+    from sglang.srt.hardware_backend.npu.batch_invariant_ops.npu_batch_invariant_ops import npu_mean_batch_invariant
+
+    from .npu_backend import ServingValue
+
+    if hidden_states.device.type != "npu" or hidden_states.dtype != torch.bfloat16:
+        return hidden_states.unflatten(-1, (streams, -1)).float().mean(-2).to(hidden_states.dtype)
+    with torch.no_grad():
+        aligned = npu_mean_batch_invariant(
+            hidden_states.unflatten(-1, (streams, -1)), [-2],
+        ).to(hidden_states.dtype)
+    if torch.is_grad_enabled() and hidden_states.requires_grad:
+        original = hidden_states.unflatten(-1, (streams, -1)).float().mean(-2).to(hidden_states.dtype)
+        return ServingValue.apply(original, aligned)
+    return aligned
 
 
 def get_glm5_next_spec(args, config, vp_stage):
