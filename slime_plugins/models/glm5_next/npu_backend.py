@@ -260,7 +260,21 @@ def serving_chunk_kda(q, k, v, *, g, beta, raw_beta, cu_seqlens, cp_context=None
 
     with torch.no_grad():
         kernel = TritonKDAKernel()
-        if os.getenv("GLM53_KDA_GROUPED_RECURRENCE") == "1":
+        if os.getenv("GLM53_TUNE_KDA_ZERO_STATE") == "1" and q.shape[2] == 64 and q.shape[1] >= 1024:
+            from sglang.kernels.ops.attention.fla.fused_sigmoid_gating_recurrent import (
+                fused_sigmoid_gating_delta_rule_update,
+            )
+
+            serving = fused_sigmoid_gating_delta_rule_update(
+                A_log=a_log, a=g.contiguous(), dt_bias=dt_bias, softplus_beta=1.0,
+                softplus_threshold=20.0, q=q.contiguous(), k=k.contiguous(),
+                v=v.contiguous(), b=raw_beta.contiguous(), initial_state_source=None,
+                initial_state_indices=None,
+                cu_seqlens=torch.tensor(bounds, device=q.device, dtype=torch.int32),
+                use_qk_l2norm_in_kernel=True, is_kda=True, lower_bound=kwargs["lower_bound"],
+                value_tile=int(os.getenv("GLM53_TUNE_KDA_TILE", "64")),
+            )
+        elif os.getenv("GLM53_KDA_GROUPED_RECURRENCE") == "1":
             count = len(bounds) - 1
             state = torch.zeros((count + 1, v.shape[2], v.shape[3], k.shape[3]),
                                 device=q.device, dtype=torch.float32)
