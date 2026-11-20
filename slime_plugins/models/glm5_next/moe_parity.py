@@ -65,14 +65,28 @@ def eight_shard_moe(
     limit = layer.config.activation_func_clamp_value
     scale = layer.config.moe_router_topk_scaling_factor
     finalize = NPUFinalizeRouting(drop_pad_mode=2)
+    wide_activation = None
+    if (
+        os.getenv("GLM53_TUNE_MOE_UP") == "1"
+        and permuted.device.type == "npu"
+        and permuted.dtype == torch.bfloat16
+        and 0 < permuted.shape[0] <= int(os.getenv("GLM53_TUNE_MOE_UP_ROWS", "16384"))
+    ):
+        wide_activation = swiglu(grouped_linear(permuted, w1, counts), limit).chunk(8, dim=-1)
+
     mixtures = []
-    for g, u, w, sg, su, sd in zip(
+    shards = zip(
         gate.chunk(8, dim=1), up.chunk(8, dim=1), w2.chunk(8, dim=2),
         shared_gate.chunk(8, dim=0), shared_up.chunk(8, dim=0), shared_down.chunk(8, dim=1),
         strict=True,
-    ):
-        gate_up = grouped_linear(permuted, torch.cat((g, u), dim=1), counts)
-        expert_out = grouped_linear(swiglu(gate_up, limit), w.contiguous(), counts)
+    )
+    for rank, (g, u, w, sg, su, sd) in enumerate(shards):
+        if wide_activation is None:
+            gate_up = grouped_linear(permuted, torch.cat((g, u), dim=1), counts)
+            activated = swiglu(gate_up, limit)
+        else:
+            activated = wide_activation[rank].contiguous()
+        expert_out = grouped_linear(activated, w.contiguous(), counts)
         routed = finalize._finalize_routing(
             expert_out, probabilities.to(x.dtype), expanded, ids,
         )
