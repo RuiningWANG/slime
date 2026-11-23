@@ -14,6 +14,7 @@ from transformers import AutoTokenizer
 
 from slime.data.tensor import TensorRef
 from slime.observability import train_data_utils, train_metric_utils
+from slime.observability.actor_logprob_audit import audit_rollout
 from slime.observability.logging_utils import init_tracking
 from slime.observability.profile_utils import TrainProfiler
 from slime.observability.timer import Timer, inverse_timer, timer, with_defer
@@ -560,7 +561,8 @@ class MegatronTrainRayActor(TrainRayActor):
             capture_log_probs = self.args.save_debug_train_data is not None and "log_probs" not in rollout_data
             if capture_log_probs:
                 enable_log_prob_capture()
-            with timer("actor_train"):
+            audit = audit_rollout(rollout_id) if os.getenv("GLM53_STRICT_LOSS_AUDIT") == "1" else nullcontext()
+            with timer("actor_train"), audit:
                 train(
                     rollout_id,
                     self.model,

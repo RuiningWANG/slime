@@ -10,6 +10,7 @@ from megatron.core import mpu
 from torch.utils.checkpoint import checkpoint
 
 from slime.data.tensor import TensorRef
+from slime.observability.actor_logprob_audit import compare_policy_scores
 from slime.utils.distributed_utils import distributed_masked_whiten
 from slime.utils.misc import load_function
 from slime.utils.ppo_utils import (
@@ -1196,6 +1197,7 @@ def policy_loss_function(
     # unless capture is enabled). Must run before the torch.cat below rebinds
     # `log_probs` to a single concatenated tensor.
     _maybe_capture_log_probs(batch, log_probs)
+    compare_policy_scores(batch, log_probs)
     if not args.use_rollout_logprobs and not old_log_probs:
         old_log_probs = [log_prob.detach() for log_prob in log_probs]
     train_log_probs_for_tis = batch.get("log_probs")
