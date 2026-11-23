@@ -96,6 +96,42 @@ def eight_shard_moe(
     return ordered_shard_sum(tuple(mixtures))
 
 
+def serving_ep2_forward(layer, x, ids, probabilities):
+    """Apply each serving rank's BF16 scale and shared expert before reducing."""
+    ep = layer.ep_group
+    local_experts = layer.num_local_experts
+    config = layer.config
+    if ep.size() != 2 or config.num_moe_experts != 2 * local_experts:
+        raise RuntimeError("The serving EP2 forward expects two contiguous expert partitions")
+
+    expert_fc1 = all_expert_weights(layer.experts.linear_fc1, ep, local_experts, x.dtype)
+    expert_fc2 = all_expert_weights(layer.experts.linear_fc2, ep, local_experts, x.dtype)
+    shared = layer.shared_experts
+    gate, up = shared.linear_fc1.weight.chunk(2, dim=0)
+    gate_shards = gate.chunk(2, dim=0)
+    up_shards = up.chunk(2, dim=0)
+    down_shards = shared.linear_fc2.weight.chunk(2, dim=1)
+    init = NPUMoEInitRouting_v2()
+    finalize = NPUFinalizeRouting(drop_pad_mode=2)
+    limit = config.activation_func_clamp_value
+    scale = config.moe_router_topk_scaling_factor
+    partials = []
+    for rank in range(2):
+        begin = rank * local_experts
+        end = begin + local_experts
+        local_ids = torch.where((ids >= begin) & (ids < end), ids - begin, -1)
+        permuted, expanded, counts, _ = init._init_routing(
+            x, local_ids, local_experts, config.moe_router_topk,
+        )
+        gate_up = grouped_linear(permuted, expert_fc1[begin:end], counts)
+        expert_output = grouped_linear(swiglu(gate_up, limit), expert_fc2[begin:end], counts)
+        routed = finalize._finalize_routing(expert_output, probabilities, expanded, local_ids)
+        shared_gate_up = F.linear(x, torch.cat((gate_shards[rank], up_shards[rank]), dim=0))
+        shared_output = F.linear(swiglu(shared_gate_up, limit), down_shards[rank].contiguous())
+        partials.append(routed * scale + shared_output)
+    return partials[0] + partials[1]
+
+
 @torch.no_grad()
 def serving_forward(layer, hidden_states):
     config = layer.config
@@ -116,6 +152,9 @@ def serving_forward(layer, hidden_states):
         eps=1e-20,
     )
     ids = ids.to(torch.int32)
+    if os.getenv("GLM53_REPLAY_SERVING_MOE_EP2") == "1":
+        return serving_ep2_forward(layer, x, ids, probabilities.to(x.dtype)).reshape_as(hidden_states)
+
     permuted, expanded, counts, _ = NPUMoEInitRouting_v2()._init_routing(
         x, ids, config.num_moe_experts, k
     )
