@@ -1,7 +1,7 @@
 """Ascend backend for the GLM5-next model.
 
 KDA and causal convolution use AscendC forward/backward bridges. Gated
-normalization uses PyTorch NPU operations; sparse MLA uses CANN AscendC.
+normalization shares the inference forward with a training backward; sparse attention uses CANN SparseFlashAttention.
 CP exchanges sequence shards for head shards when the head count is divisible
 by the CP size, and restores the local sequence layout after computation.
 """
@@ -13,18 +13,14 @@ import torch
 import torch.nn.functional as F
 from megatron.core.tensor_parallel.mappings import all_to_all, gather_from_sequence_parallel_region
 
+from .gated_rmsnorm import FusedRMSNormGated
+from .packed_sequence import packed_boundaries
+
 
 def _boundaries(cu, length):
-    boundaries = [0, length] if cu is None else (cu.tolist() if hasattr(cu, "tolist") else list(cu))
     if length <= 0:
         raise ValueError("Packed input must contain at least one token")
-    if len(boundaries) < 2 or any(not isinstance(value, int) for value in boundaries):
-        raise ValueError("Packed boundaries must contain at least two integer offsets")
-    if boundaries[0] != 0 or boundaries[-1] != length:
-        raise ValueError(f"Packed boundaries do not cover {length} tokens: {boundaries}")
-    if any(end < start for start, end in zip(boundaries, boundaries[1:], strict=False)):
-        raise ValueError("Packed boundaries must be nondecreasing")
-    return boundaries
+    return packed_boundaries(cu if cu is not None else [0, length], length)
 
 
 def _gather(x, context):
@@ -62,12 +58,7 @@ def build_cp_context(cu_seqlens, group, conv1d_kernel_size):
 
 
 def _convolve(x, weight, activation, cu):
-    # Dispatch Conv1d independently of KDA availability. The torch backend
-    # can be selected explicitly through the environment setting.
-    backend = os.environ.get("GLM53_CONV_BACKEND", "ascendc")
-    if backend not in ("ascendc", "torch"):
-        raise ValueError(f"Unsupported GLM53_CONV_BACKEND: {backend}")
-    if backend == "ascendc" and x.device.type == "npu" and x.dtype in (torch.bfloat16, torch.float16):
+    if x.device.type == "npu" and x.dtype in (torch.bfloat16, torch.float16):
         from .ascendc_conv1d import causal_conv1d_ascendc
 
         return causal_conv1d_ascendc(x, weight, activation, cu)
@@ -76,18 +67,24 @@ def _convolve(x, weight, activation, cu):
 
 def _convolve_torch(x, weight, activation, cu):
     outputs = []
+    # Cast once so gradients from packed sequences accumulate in FP32 before
+    # the final weight-gradient cast, just as in the fused convolution.
+    fused_silu = activation == "silu" and x.dtype in (torch.bfloat16, torch.float16)
+    conv_weight = weight.to(x.dtype).float() if fused_silu else weight
     for start, end in zip((bounds := _boundaries(cu, x.shape[1]))[:-1], bounds[1:], strict=True):
         if start == end:
             continue
         part = x[:, start:end].transpose(1, 2)
-        with torch.profiler.record_function("glm53::conv_fallback"):
-            part = F.pad(part, (weight.shape[-1] - 1, 0))
-            part = F.conv1d(part, weight[:, None], groups=weight.shape[0]).transpose(1, 2)
+        # Match fused inference: round only after SiLU, with casts in autograd.
+        if fused_silu:
+            part = part.float()
+        part = F.pad(part, (weight.shape[-1] - 1, 0))
+        part = F.conv1d(part, conv_weight[:, None], groups=weight.shape[0]).transpose(1, 2)
         if activation == "silu":
             part = F.silu(part)
         elif activation is not None:
             raise ValueError(f"Unsupported convolution activation: {activation}")
-        outputs.append(part)
+        outputs.append(part.to(x.dtype))
     return torch.cat(outputs, dim=1)
 
 
@@ -116,21 +113,6 @@ def causal_conv1d(x, weight, activation, cp_context):
     return _local(out, cp_context), None
 
 
-class FusedRMSNormGated(torch.nn.Module):
-    """Same parameter contract; use autograd-supported NPU operations."""
-
-    def __init__(self, hidden_size, eps, activation="sigmoid"):
-        super().__init__()
-        if activation != "sigmoid":
-            raise ValueError("GLM5-next gated norm expects sigmoid")
-        self.weight = torch.nn.Parameter(torch.ones(hidden_size))
-        self.eps = eps
-
-    def forward(self, x, gate):
-        normalized = x.float() * torch.rsqrt(x.float().square().mean(-1, keepdim=True) + self.eps)
-        return (normalized * self.weight.float() * gate.float().sigmoid()).to(x.dtype)
-
-
 def chunk_kda(q, k, v, *, g, beta, cu_seqlens, cp_context=None, **kwargs):
     from .ascendc_kda import chunk_kda_ascendc
 
@@ -156,8 +138,7 @@ def chunk_kda(q, k, v, *, g, beta, cu_seqlens, cp_context=None, **kwargs):
     if mode == "packed":
         # Remove empty sequences without changing token positions.
         bounds = list(dict.fromkeys(bounds))
-        with torch.profiler.record_function("glm53::kda_packed"):
-            out, _ = chunk_kda_ascendc(q, k, v, g=g, beta=beta, cu_seqlens=bounds, **kwargs)
+        out, _ = chunk_kda_ascendc(q, k, v, g=g, beta=beta, cu_seqlens=bounds, **kwargs)
         return local_output(out), None
     outputs = []
     for start, end in zip(bounds[:-1], bounds[1:], strict=True):
@@ -173,12 +154,3 @@ def chunk_kda(q, k, v, *, g, beta, cu_seqlens, cp_context=None, **kwargs):
         )
         outputs.append(out)
     return local_output(torch.cat(outputs, dim=1)), None
-
-
-class SparseMLA:
-    @staticmethod
-    def apply(q, kv, indices, scaling):
-        # Keep CANN SMLA loading lazy for rollout/driver-only imports.
-        from .ascendc_smla import SparseMLA as AscendCSparseMLA
-
-        return AscendCSparseMLA.apply(q, kv, indices, scaling)

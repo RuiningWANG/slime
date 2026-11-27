@@ -77,6 +77,48 @@ def pad_thd_sequences_for_cp(
         torch.tensor(cu_seqlens_padded, dtype=torch.int32, device=device),
     )
 
+
+def get_logits_and_tokens_offset_with_cp(
+    total_length: int,
+    response_length: int,
+):
+    """
+    All offsets start from the begining of the prompt.
+    """
+    cp_rank = mpu.get_context_parallel_rank()
+    cp_size = mpu.get_context_parallel_world_size()
+    assert cp_size > 1
+
+    prompt_length = total_length - response_length
+    chunk_size = (total_length + 2 * cp_size - 1) // (2 * cp_size)
+
+    # the offset of 2 chunks
+    chunk_0 = (cp_rank * chunk_size, (cp_rank + 1) * chunk_size)
+    chunk_1 = (
+        (2 * cp_size - cp_rank - 1) * chunk_size,
+        (2 * cp_size - cp_rank) * chunk_size,
+    )
+
+    # the offset of 2 logits, note that the logits need a "-1".
+    logits_0 = (max(chunk_0[0], prompt_length - 1), min(chunk_0[1], total_length - 1))
+    logits_1 = (max(chunk_1[0], prompt_length - 1), min(chunk_1[1], total_length - 1))
+
+    # when the sequence is empty, make an empty slice to continue the gradient flow.
+    if logits_0[0] < logits_0[1]:
+        token_0 = (logits_0[0] + 1, logits_0[1] + 1)
+    else:
+        logits_0 = (0, 0)
+        token_0 = (0, 0)
+
+    if logits_1[0] < logits_1[1]:
+        token_1 = (logits_1[0] + 1, logits_1[1] + 1)
+    else:
+        logits_1 = (0, 0)
+        token_1 = (0, 0)
+
+    return chunk_size, (chunk_0, chunk_1), (logits_0, logits_1), (token_0, token_1)
+
+
 def get_thd_partitioned_indices(
     cu_seqlens_padded: torch.Tensor,
     total_tokens: int,
@@ -131,47 +173,6 @@ def get_thd_partitioned_indices(
     )
 
     return indices
-
-
-def get_logits_and_tokens_offset_with_cp(
-    total_length: int,
-    response_length: int,
-):
-    """
-    All offsets start from the begining of the prompt.
-    """
-    cp_rank = mpu.get_context_parallel_rank()
-    cp_size = mpu.get_context_parallel_world_size()
-    assert cp_size > 1
-
-    prompt_length = total_length - response_length
-    chunk_size = (total_length + 2 * cp_size - 1) // (2 * cp_size)
-
-    # the offset of 2 chunks
-    chunk_0 = (cp_rank * chunk_size, (cp_rank + 1) * chunk_size)
-    chunk_1 = (
-        (2 * cp_size - cp_rank - 1) * chunk_size,
-        (2 * cp_size - cp_rank) * chunk_size,
-    )
-
-    # the offset of 2 logits, note that the logits need a "-1".
-    logits_0 = (max(chunk_0[0], prompt_length - 1), min(chunk_0[1], total_length - 1))
-    logits_1 = (max(chunk_1[0], prompt_length - 1), min(chunk_1[1], total_length - 1))
-
-    # when the sequence is empty, make an empty slice to continue the gradient flow.
-    if logits_0[0] < logits_0[1]:
-        token_0 = (logits_0[0] + 1, logits_0[1] + 1)
-    else:
-        logits_0 = (0, 0)
-        token_0 = (0, 0)
-
-    if logits_1[0] < logits_1[1]:
-        token_1 = (logits_1[0] + 1, logits_1[1] + 1)
-    else:
-        logits_1 = (0, 0)
-        token_1 = (0, 0)
-
-    return chunk_size, (chunk_0, chunk_1), (logits_0, logits_1), (token_0, token_1)
 
 
 def get_sum_of_sample_mean(
@@ -601,9 +602,6 @@ def prepare_routed_experts_for_routing_replay(
     pad_size = mpu.get_tensor_model_parallel_world_size() * data_pad_size_multiplier
     cp_size = mpu.get_context_parallel_world_size()
     cp_rank = mpu.get_context_parallel_rank()
-    if cp_size > 1 and not allgather_cp:
-        # Match the physical-only tail used by get_batch's THD CP packing.
-        pad_size = math.lcm(2, mpu.get_tensor_model_parallel_world_size())
     range_start = 0
 
     if allgather_cp:

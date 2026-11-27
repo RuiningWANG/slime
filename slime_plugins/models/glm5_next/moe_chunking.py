@@ -1,6 +1,6 @@
 """Bound native GLM MoE workspaces without replacing its math kernels.
 
-Zero chunk sizes select the original forward for controlled A/B measurements.
+A chunk size of zero selects the unchunked forward pass.
 Each complete MoE chunk is checkpointed with full replay: the mutable dispatcher is
 reconstructed immediately before its backward, not reused from another chunk.
 """

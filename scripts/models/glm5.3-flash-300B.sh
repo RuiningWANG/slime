@@ -22,7 +22,7 @@ MODEL_ARGS=(
     --normalization RMSNorm
     --norm-epsilon 1e-5
     --rotary-base 800000
-    --num-experts 288
+    --num-experts "${NUM_EXPERTS:-288}"
     --moe-layer-freq '[0]*3+[1]*42'
     --moe-ffn-hidden-size 2048
     --moe-shared-expert-intermediate-size 2048

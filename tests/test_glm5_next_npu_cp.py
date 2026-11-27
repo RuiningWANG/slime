@@ -64,7 +64,6 @@ def main():
     check(al.grad, ar.grad, "KDA A_log", reduce=True)
     check(bl.grad, br.grad, "KDA dt_bias", reduce=True)
     torch.npu.synchronize()
-    print(f"CP{size} rank {rank}: Conv1d and KDA forward/backward passed", flush=True)
     dist.destroy_process_group()
 
 

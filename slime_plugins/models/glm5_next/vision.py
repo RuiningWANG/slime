@@ -14,12 +14,17 @@ from transformers.models.glm_ocr.modeling_glm_ocr import (
 )
 
 from .attention import RMSNorm
+from .ops import swiglu_with_limit
 
 
 def vision_swiglu_with_limit(x, limit):
-    # Vision activations use FP32 independently of the language-model backend.
-    gate, up = x.float().chunk(2, dim=-1)
-    return (F.silu(gate.clamp(max=limit)) * up.clamp(-limit, limit)).to(x.dtype)
+    if x.device.type == "npu":
+        # Inference disables torch.compile on NPU. Match its eager rounding
+        # at each operation, including the BF16 SiLU intermediate.
+        gate, up = x.chunk(2, dim=-1)
+        return F.silu(gate.clamp(max=limit)) * up.clamp(-limit, limit)
+    # Preserve the FP32 intermediates used by compiled inference elsewhere.
+    return swiglu_with_limit(x, limit)
 
 
 class Glm5NextVisionRMSNorm(RMSNorm):
@@ -38,6 +43,10 @@ class Glm5NextVisionBlock(GlmOcrVisionBlock):
         self.norm2 = Glm5NextVisionRMSNorm(config.hidden_size, config.rms_norm_eps)
         # NPU Q/K normalization uses the model epsilon; GPU uses 1e-6.
         qk_norm_eps = config.rms_norm_eps if accelerator.device_type() == "npu" else 1e-6
+        if accelerator.device_type() == "npu":
+            from .vision_attention import Glm5NextVisionAttention
+
+            self.attn = Glm5NextVisionAttention(config)
         self.attn.q_norm = Glm5NextVisionRMSNorm(config.hidden_size // config.num_heads, qk_norm_eps)
         self.attn.k_norm = Glm5NextVisionRMSNorm(config.hidden_size // config.num_heads, qk_norm_eps)
         self.mlp = Glm5NextVisionMLP(config)
@@ -66,19 +75,64 @@ class Glm5NextVisionMLP(GlmOcrVisionMlp):
         self.limit = config.swiglu_limit
 
     def forward(self, x):
-        gate_up = torch.cat((self.gate_proj(x), self.up_proj(x)), dim=-1)
-        return self.down_proj(vision_swiglu_with_limit(gate_up, self.limit).to(x.dtype))
+        if x.device.type == "npu":
+            # Match inference's packed gate/up GEMM shape and BF16 rounding.
+            # Concatenation preserves checkpoint keys and autograd to both
+            # parameters; no detached or duplicated trainable weights.
+            weight = torch.cat((self.gate_proj.weight, self.up_proj.weight), dim=0)
+            bias = torch.cat((self.gate_proj.bias, self.up_proj.bias), dim=0)
+            gate_up = F.linear(x, weight, bias)
+        else:
+            gate_up = torch.cat((self.gate_proj(x), self.up_proj(x)), dim=-1)
+        return self.down_proj(vision_swiglu_with_limit(gate_up, self.limit))
+
+
+class Glm5NextVisionLayerNorm(nn.LayerNorm):
+    """Match inference LayerNorm precision while preserving checkpoint keys."""
+
+    def forward(self, x):
+        return F.layer_norm(
+            x.float(), self.normalized_shape,
+            self.weight.float() if self.weight is not None else None,
+            self.bias.float() if self.bias is not None else None,
+            self.eps,
+        ).to(x.dtype)
 
 
 class Glm5NextVisionMerger(GlmOcrVisionPatchMerger):
     def __init__(self, config):
         super().__init__(config.out_hidden_size, config.projection_intermediate_size, config.hidden_act)
+        self.post_projection_norm = Glm5NextVisionLayerNorm(
+            self.post_projection_norm.normalized_shape, eps=1e-6
+        )
         self.limit = config.swiglu_limit
+        # Store one trainable matrix, in inference's [gate; up] order. No
+        # weight concatenation or duplicated parameters in the forward path.
+        assert self.gate_proj.bias is None and self.up_proj.bias is None
+        self.gate_up_proj = nn.Linear(
+            self.gate_proj.in_features, 2 * self.gate_proj.out_features, bias=False,
+            device=self.gate_proj.weight.device, dtype=self.gate_proj.weight.dtype,
+        )
+        with torch.no_grad():
+            self.gate_up_proj.weight.copy_(torch.cat((self.gate_proj.weight, self.up_proj.weight), dim=0))
+        del self.gate_proj, self.up_proj
+
+    def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict,
+                              missing_keys, unexpected_keys, error_msgs):
+        # Accept legacy plain PyTorch/HF state dicts as well as new packed
+        # state dicts. The streaming HF loader has the same conversion.
+        packed = prefix + "gate_up_proj.weight"
+        gate, up = prefix + "gate_proj.weight", prefix + "up_proj.weight"
+        if packed not in state_dict and gate in state_dict and up in state_dict:
+            state_dict[packed] = torch.cat((state_dict.pop(gate), state_dict.pop(up)), dim=0)
+        super()._load_from_state_dict(
+            state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs
+        )
 
     def forward(self, x):
         x = self.act1(self.post_projection_norm(self.proj(x)))
-        gate_up = torch.cat((self.gate_proj(x), self.up_proj(x)), dim=-1)
-        return self.down_proj(vision_swiglu_with_limit(gate_up, self.limit).to(x.dtype))
+        gate_up = self.gate_up_proj(x)
+        return self.down_proj(vision_swiglu_with_limit(gate_up, self.limit))
 
 
 class Glm5NextPatchEmbed(GlmOcrVisionPatchEmbed):
@@ -100,12 +154,11 @@ class Glm5NextVisionModel(GlmOcrVisionModel):
         self.post_layernorm = Glm5NextVisionRMSNorm(config.hidden_size, config.rms_norm_eps)
         if accelerator.device_type() == "npu":
             # Use one FP32 frequency table regardless of the construction device.
-            # CPU/NPU pow differs by an ULP, which can amplify through this ViT.
             rotary = self.rotary_pos_emb
-            rotary.inv_freq = (
-                1.0
-                / (rotary.theta ** (torch.arange(0, rotary.dim, 2, dtype=torch.float32, device="cpu") / rotary.dim))
-            ).to(rotary.inv_freq.device)
+            with torch.device("cpu"):
+                inv_freq, _ = rotary.compute_axial_rope_parameters(rotary.config, device="cpu")
+            rotary.inv_freq = inv_freq.to(rotary.inv_freq.device)
+            rotary.original_inv_freq = rotary.inv_freq.clone()
 
     def forward(self, hidden_states, grid_thw, **kwargs):
         # Keep GEMM shapes independent of rollout batching and training packing.
@@ -124,12 +177,9 @@ class Glm5NextVisionModel(GlmOcrVisionModel):
     def _apply(self, fn, recurse=True):
         # Frequencies are not checkpoint parameters. Preserve their original
         # FP32 values when Megatron casts the model weights to BF16.
-        inv_freq = self.rotary_pos_emb.inv_freq
+        rotary = self.rotary_pos_emb
+        frequencies = {name: getattr(rotary, name) for name in ("inv_freq", "original_inv_freq")}
         super()._apply(fn, recurse=recurse)
-        self.rotary_pos_emb.inv_freq = inv_freq.to(device=self.rotary_pos_emb.inv_freq.device)
+        for name, frequency in frequencies.items():
+            setattr(rotary, name, frequency.to(device=getattr(rotary, name).device))
         return self
-
-# Optional paired ViT feature validation; no effect unless explicitly enabled.
-if __import__('os').environ.get('GLM53_VIT_CAPTURE_DIR'):
-    from glm53_vit_feature_capture import install as _install_vit_capture
-    _install_vit_capture(Glm5NextVisionModel, 'train')

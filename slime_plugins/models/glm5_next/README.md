@@ -1,228 +1,90 @@
-# GLM-5.3 Flash / GLM5-next
+# GLM-5.3 Flash on Ascend
 
-Native Megatron integration for the `Glm5NextForConditionalGeneration` checkpoint.
-The language model uses the same spec/provider entry point as the GLM5 plugin;
-the CogViT wrapper follows the Qwen3.5 integration.
+本配置用于 CANN 9.2.0、Linux aarch64 和 Python 3.12。仓库根目录的 `build.sh` 按清单将 Slime 补丁应用到子模块，并将 `operators/<算子组>/` 中的模块安装到 `slime_plugins.models.glm5_next`。打包后的 Slime 可独立导入这些模块。上游 CUDA 配置见 [Slime 模型文档](https://github.com/THUDM/slime/blob/18868a79b0b083a093798a94ed0f8cb4f71b9c14/slime_plugins/models/glm5_next/README.md)。
 
-The 300B configuration has 45 layers: 34 KDA layers, 11 no-RoPE MLA layers with
-learned four-token DSA pooling, four mHC residual streams, and 288 routed experts.
-The first three layers use dense MLPs. Dense, routed, shared, and visual MLPs use
-the checkpoint's SwiGLU clamp of 10.
+## 源码版本
 
-## Environment and parallelism
+Slime 的上游提交由 `upstream_commit` 指定。依赖仓库的地址和版本由 `[glm53.sources]` 指定，其中 `patch` 引用对应补丁的 `base_commit`。完整 SHA 和应用顺序见[补丁清单](https://gitcode.com/Ascend/slime-ascend/blob/dev/patches/MANIFEST.toml)。
 
-Use the CUDA 13 image with upstream Megatron Core's TE module builders,
-`flash-linear-attention` (`fla`), TileLang, and Transformers' GLM-OCR vision
-components. SGLang must support GLM5-next, pooled DSA, KDA, routed-expert capture,
-score centering, and top-p replay.
+| 组件 | 本配置的改动 |
+| --- | --- |
+| Slime | 在 dev 通用补丁后应用 `features/glm5.3-flash.patch` |
+| Megatron-LM | 在 dev 的两份 Megatron 补丁后应用优化器补丁 |
+| SGLang | GLM5-next 图像、MoE 激活、通信和图捕获 |
+| sgl-kernel-npu | TorchMemorySaver、图捕获和 DeepEP 构建 |
+| ops-transformer | 在 custom wheel 暂存目录中调整 builder 导入 |
+| flash-linear-attention-npu | 按目标 SoC 从源码构建 KDA、Conv1d 所需的 wheel |
+| MegatronAdaptor | 使用上游源码 |
+| TransformerEngineNPU | 使用上游源码 |
 
-The current native attention implementation requires **TP=1**. For **CP>1**,
-use **`--allgather-cp`**: the packed token stream is split into contiguous
-intervals. MLA gathers compressed KV and indexer keys; KDA uses FLA's CP
-convolution and recurrent-state exchange. The 64-H100 recipe defaults to CP=2,
-PP=4 and EP=16, with expert TP=1. `CP_SIZE=1` selects the unsharded context
-baseline. Packed sequence boundaries isolate both KDA state and sparse
-attention. Indexer parameters are frozen. The recipe freezes the vision tower for text training;
-the wrapper also accepts `pixel_values` / `image_grid_thw` and
-`pixel_values_videos` / `video_grid_thw` for multimodal training.
+## 安装
 
-## Three-step validation recipe
-
-Assume the BF16 checkpoint has been downloaded to `/data/GLM-5.3-Flash` and the
-dataset to `/data/dapo-math-17k/dapo-math-17k.jsonl`, with `/data` shared across
-nodes. Start an eight-node Ray cluster with eight H100 GPUs per node, then run
-from the repository root:
+在 `slime-ascend` 仓库的 `dev` 分支根目录下，激活 Python 虚拟环境并加载目标节点的 CANN 9.2 Toolkit、配套算子包及 NNAL/ATB 环境。源码构建需要 Git（含可用的提交者身份供 `git am` 使用）、C/C++ 编译器、CMake 和 Rust 工具链。选择可写的空依赖目录。安装脚本会下载源码、构建 SoC 对应的算子和 Python 包。
 
 ```bash
-BASE_DIR=/data \
-bash scripts/run-glm5.3-flash-300B.sh --check-weight-update-equal
+export SLIME_ASCEND_DEPS_ROOT="$PWD/../glm53-deps"
+bash scripts/quick_install.sh --glm5.3-flash a5
+export FLA_NPU_DISABLE_PTH=1 TORCH_DEVICE_BACKEND_AUTOLOAD=1
+python_site=$(python -c 'import sysconfig; print(sysconfig.get_path("platlib"))')
+source "$SLIME_ASCEND_DEPS_ROOT/opp/vendors/custom_transformer/bin/set_env.bash"
+source "$python_site/deep_ep/vendors/hwcomputing/bin/set_env.bash"
+source "$python_site/fla_npu/opp/vendors/fla_npu_transformer/bin/set_env.bash"
+export MEGATRON_PATH="$SLIME_ASCEND_DEPS_ROOT/Megatron-LM"
 ```
 
-Override `HF_CHECKPOINT` and `PROMPT_DATA` for other downloaded locations.
-NCCL/Gloo select their interfaces automatically; set `SOCKET_IFNAME` if the
-cluster requires a particular interface. `MEGATRON_PATH` defaults to the
-standard image location `/root/Megatron-LM`.
+A3 构建使用参数 `a3`。每个运行节点都要使用对应 SoC 的同一套环境，并在启动 Ray 前加载 CANN、自定义 vendor 和已安装的 FLA、DeepEP 环境。
 
-The dataset uses `prompt` and `label` fields. The default reward is `deepscaler`;
-use an appropriate reward for your data. `RM_TYPE=random` is only useful for a
-smoke test with nonzero training gradients, not for assessing model quality.
-The script enables R3, score centering, top-p=0.95 replay, and a nonzero learning
-rate. It defaults to three rollouts and writes debug training data under
-`RUN_DIR`.
-Each rollout contains 16 prompts with eight samples each (global batch 128).
-The default response limit is 32768 tokens, with a 65536-token context window.
-Decode CUDA Graph is enabled for inference; training CUDA Graph remains disabled.
-Entropy and KL regularization use their zero defaults.
+### A5 Docker 镜像
 
-`--check-weight-update-equal` snapshots the initial inference weights, resets
-them, and compares every tensor after the initial Megatron-to-SGLang update.
-This also checks that the expert routing optimization sends complete weights.
-The direct HF loader keeps router correction biases in FP32 before copying.
-Legacy `safe_gate=true` checkpoints are normalized to `gate_lower_bound=-5`
-for both training and SGLang startup. Explicit gate bounds take precedence.
-Use the updated `latest` or `v0.5.21` Megatron image patch: checkpoint reload must
-refresh already-FP32 CPU optimizer copies as well as BF16 master parameters.
-Without that fix, the first optimizer step overwrites loaded mHC/KDA parameters
-with stale initialization values.
-
-## Validation results
-
-The full 300B checkpoint also completed three steps with **CP=2 and
-`--allgather-cp`** on 64 H100s on 2026-10-16 (`local/glm53/run12-cp2`, Ray job
-`raysubmit_FNCVTyJS6GAqXbz2`, status `SUCCEEDED`). All 64 inference ranks passed
-the initial weight equality check. The run retained batch 128, R3, score
-centering, top-p=0.95 replay, learning rate 1e-6, and the same graph settings.
-
-| Step | Sample-mean logprob diff | Token-mean logprob diff | Gradient norm | Training time |
-| --- | --- | --- | --- | --- |
-| 1 | 0.00629394 | 0.00791693 | 0.76393992 | 452.3 s |
-| 2 | 0.00618919 | 0.00837462 | 0.80803555 | 58.2 s |
-| 3 | 0.00631780 | 0.00812524 | 0.65333384 | 63.4 s |
-
-The first step included new FLA CP kernel compilation and autotuning; stack
-samples captured compilation delaying other pipeline stages. Completed caches
-were merged and broadcast to all eight nodes. Initial weight synchronization
-took 18.2 seconds, and subsequent updates took 18.7, 25.8, and 24.2 seconds.
-All 307,494 response tokens passed the top-p replay audit; responses remained
-coherent after updates, with no truncation. The longest response was 5330 tokens.
-CP=4 is covered by distributed attention/vision regression tests, while the
-full-model three-step run used CP=2. These runs do not establish 32k-response
-or full-model multimodal training performance.
-
-The full 300B BF16 checkpoint completed three consecutive training steps on
-64 H100s with CP=1 on 2026-10-16 (`local/glm53/run11`, Ray job
-`raysubmit_VMBJeNVbE1yJxSSQ`, status `SUCCEEDED`). Each step used 128 samples,
-R3, score centering, top-p=0.95 replay, and Adam at learning rate 1e-6.
-
-| Step | Sample-mean logprob diff | Token-mean logprob diff | Gradient norm | Training time |
-| --- | --- | --- | --- | --- |
-| 1 | 0.00628354 | 0.00767620 | 0.63715422 | 107.8 s |
-| 2 | 0.00660455 | 0.00810495 | 0.80081755 | 49.8 s |
-| 3 | 0.00627287 | 0.00798890 | 0.83470374 | 52.0 s |
-
-Chinese explanations, arithmetic, poetry, and English stories remained coherent
-across the three rollouts. All 296,317 response tokens passed the top-p support
-and selected-token logprob audit, with no truncated responses or nonfinite
-logprobs. All 64 inference ranks captured and replayed decode CUDA Graph;
-training used `cuda_graph_impl=none`, with entropy and KL coefficients both zero.
-Weight synchronization after the steps took 20.1, 15.0, and 17.4 seconds.
-
-The configured response limit was 32768; observed responses reached 5338 tokens.
-This run used text prompts and a random smoke-test reward. Multimodal validation
-separately covered the complete vision tower, image/video feature injection,
-and backward through one real text layer. It does not establish full-model
-32k-response or multimodal training performance.
-
-The tested environment was PyTorch 2.13.0+cu130, Megatron Core
-0.19.2+4b4acac9a, SGLang 0.5.21, Transformers 5.12.1, FLA 0.5.2, TileLang
-0.1.12, and Triton 3.7.1. Local run artifacts contain
-`metrics.json`, `validation.json`, `answers.json`, `top-p-audit.json`, and logs
-from all eight nodes.
-
-## Precision and optimization
-
-The patch embedding replaces a convolution over complete nonoverlapping patches
-with the equivalent GEMM, including the bias in the GEMM epilogue. Its output
-matches SGLang and has lower error against FP64 than the original BF16 Conv3d.
-KDA state parameters and mHC scale/bias parameters remain FP32; SwiGLU evaluates
-its pointwise arithmetic in FP32 before storing BF16 output.
-
-The shared sparse MLA backward kernel uses runtime sequence lengths, matching
-the forward kernel. A new packed length reuses the compiled kernel instead of
-compiling another specialization. Forward and gradients are checked against
-FP64 attention, including partial tiles; dQ matches the former static kernel
-exactly and dKV differences stay within its existing atomic-add variability.
-
-Colocated weight updates use slime's existing expert routing path, including
-the VLM's `language_model` parameter prefix. On the 64-H100 300B validation run,
-this reduced transfer groups from 587 to 61 and total initial synchronization
-from 97.9 to 21.5 seconds, including communication-group restoration, with all
-64 inference ranks passing the initial weight equality check.
-
-Focused regression tests:
+基础开发镜像需包含 Linux ARM64、CANN 9.2.0 Toolkit、950 算子包、NNAL/ATB、Python 3.12 及上述编译工具链。将 `CANN_BASE_IMAGE` 设为可拉取的镜像引用（建议指定 digest），在 `slime-ascend` 根目录构建。Dockerfile 调用与裸机相同的 A5 安装入口。
 
 ```bash
-PYTHONPATH=$PWD python tests/test_glm5_next_ops.py
-PYTHONPATH=$PWD python tests/test_glm5_next_gpu.py
-PYTHONPATH=$PWD python tests/test_glm5_next_cp.py  # requires four GPUs
-PYTHONPATH=$PWD python tests/test_hf_to_megatron.py
-PYTHONPATH=$PWD python tests/test_expert_routing.py
+docker build --platform linux/arm64 \
+  --build-arg CANN_BASE_IMAGE="${CANN_BASE_IMAGE:?请指定 A5 CANN 9.2.0 开发镜像}" \
+  -f docker/Dockerfile.a5.glm53.cann920 -t slime-ascend:glm53-cann920-a5 .
 ```
 
-The CP tests cover CP=2/4, packed boundaries, all attention parameter gradients,
-and image/video feature selection and gradients. In the strong-decay test,
-FLA's BF16 backward has cancellation error even at CP=1; the FP32 gate
-parameters are therefore also checked against an independent FP64 recurrence
-to ensure context partitioning does not degrade accuracy.
+基础镜像的 Toolkit 或 ATB 环境脚本在其他位置时，分别通过 `--build-arg CANN_ENV=...`、`--build-arg ATB_ENV=...` 指定。运行时按宿主机的 Ascend 容器运行时配置挂载八卡、驱动、模型和数据。进入容器后加载 Toolkit 和 ATB，再按安装一节设置 custom_transformer、DeepEP 和 FLA 的 vendor 环境。
 
-## Ascend causal convolution
+## 算子与 wheel
 
-The native NPU backend already uses AscendC KDA forward/backward. Conv1d now has an AscendC forward/backward adapter in ascendc_conv1d.py, based on MindSpeed-Bridge's GLM-5.3-Flash kda_conv1d_fused.py. SiLU remains a separate autograd operation. Packed boundaries reset convolution history per sample. The existing CP gather/scatter path is unchanged; this is not KCP halo exchange.
+稀疏注意力使用 CANN SparseFlashAttention。A3 使用合并的 KV 梯度，A5 分别计算 K 和 V 的梯度并求和。训练端的 KPool 使用 `sgl-kernel-npu` 的索引和缓存接口，与 SGLang 推理端一致。CP 下，KDA 和 Conv1d 在头数可整除时通过 all-to-all 交换 token 与头分片。
 
-The native launcher registers cann-custom-ops/glm53-conv/vendors/glm53_conv_transformer under the dependency root before torch_npu initializes, and passes ASCEND_CUSTOM_OPP_PATH to Ray. This package supplies causal_conv1d and causal_conv1d_bwd for Ascend950/CANN 9.2. Older FLA wheels can expose Python wrappers but omit these binary symbols; the adapter supplies only missing convolution symbols from the independent library, retaining the installed KDA implementation.
+训练自定义包包含 mHC pre/post 及其反向、SGLang KPool 依赖的 PoolKeyIndexer。SDK 提供其余基础 API。安装入口从固定源码构建 vendor 和原始 Python wheel，再由 `scripts/stage_glm53_ops_wheel.py` 处理 wheel 中的 `op_builder/builder.py` 并重新生成 `RECORD`。包名、算子入口及原生二进制与上游构建产物一致。
 
-New native jobs with this vendor registered use fused convolution for BF16/FP16 NPU inputs. Jobs without it retain the PyTorch path. To compare backends, set GLM53_CONV_BACKEND to torch or ascendc in the training worker environment (--train-env-vars). Missing dependencies fail explicitly when ascendc is selected. CPU/FP32 inputs use the reference path.
+## 训练组件测试
 
-Run python -m pytest -q -s tests/test_glm5_next_ascendc_conv1d.py after initializing CANN, FLA and the independent vendor. The regression covers forward/input/weight gradients for BF16/FP16, dense and packed inputs, short/empty segments, and 8192 channels.
+在 `slime/` 子模块目录运行稀疏索引、视觉权重映射、MoE 分块和 KDA 的 CPU 测试。
 
-## Ascend mHC fusion
+```bash
+python -m pytest -q tests/test_glm5_next_sparse_index_compaction.py tests/test_glm5_next_vision_merger.py \
+    tests/test_glm5_next_moe_chunks.py tests/test_glm5_next_kda_reference.py
+```
 
-Native single-node jobs enable GLM53_MHC_BACKEND=ascendc. Set it to torch before launching for an A/B comparison. ops.py dispatches supported BF16 NPU inputs (four streams, 20 Sinkhorn iterations for pre) to ascendc_mhc.py; CPU/CUDA, other dtypes and unsupported pre configurations retain the reference implementation. An unavailable kernel raises an error rather than silently claiming fusion.
+在 A3 或 A5 上运行 KDA 和稀疏注意力的前反向数值测试。
 
-The adapter follows MindSpeed-Bridge's GLM-5.3-Flash mHC contract and uses the installed CANN mhc_pre_sinkhorn/mhc_post APIs with their official autograd backward operators. No additional native mHC library is installed. Projection/scale/bias and mixing matrices remain FP32 inside the operations; checkpoint parameter storage/layout is unchanged. Inputs are flattened over token/batch dimensions without mixing tokens. The selected CANN modules are loaded lazily using the shared loader, avoiding eager graph backend imports.
+```bash
+GLM53_TEST_NPU=1 python -m pytest -q tests/test_glm5_next_kda_reference.py tests/test_glm5_next_sfa.py
+```
 
-Numerical regression: python -m pytest -q -s tests/test_glm5_next_ascendc_mhc.py. It checks collapsed/post/residual/merged outputs and input, projection, scale, bias, sublayer-output gradients against the original FP32 reference, using hidden size 4096, nontrivial stream mixing, multiple batch sizes and up to 1024 tokens.
+## 八卡 A5 示例
 
+强化学习训练依赖配套的 SGLang 和 sgl-kernel-npu 补丁，用于路由回放、推理侧 KPool 和图捕获。
 
-## Ascend KeyPool and PoolKeyIndexer
+示例使用单机八卡，训练并行配置为 TP1、PP4、CP2、EP2，推理并行配置为 TP8。在各节点启动 Ray 前，加载 custom_transformer、DeepEP 和 FLA 的环境，并设置 `RAY_EXPERIMENTAL_NOSET_ASCEND_RT_VISIBLE_DEVICES=1` 和 `RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO=0`。脚本向当前 Ray 集群提交作业，各工作节点须能通过相同路径访问模型和数据。Geo3K 默认上下文 8192、回答上限 4096，每次 rollout 执行一步，共三步。
 
-Set `GLM53_KPOOL_BACKEND=ascendc` to opt into the CANN forward-only KeyPool
-and PoolKeyIndexer path. The default `torch` preserves the reference indexer.
-The indexer is frozen; this integration does not support an indexer auxiliary
-training loss. It uses the existing CANN installation and requires head
-dimension 128, a supported compression ratio, and topk divisible by that ratio.
+```bash
+export HF_CHECKPOINT=/path/to/GLM-5.3-Flash
+export PROMPT_DATA=/path/to/geo3k/train.jsonl
+export MULTIMODAL_KEYS='{"image":"images"}'
+export CHAT_TEMPLATE_KWARGS="$(cat /path/to/geo3k/chat_template_kwargs.json)"
+bash scripts/run-glm5.3-flash-npu.sh
+```
 
-Reference: official MindSpeed-Bridge master commit
-`f74d52a8a318c4594202ccdcf96a615b1f2d32da`, downloaded directly from
-https://gitcode.com/Ascend/MindSpeed-Bridge .
-The adapter preserves this model's pre-pooling LayerNorm and FP32 weight
-projection/scaling, then casts score weights to the query dtype as required by
-CANN. Pooling and index selection need not be bitwise identical to the reference.
+DAPO-Math 与 Geo3K 共用模型权重。文本示例默认使用 16384 上下文、8192 回答上限和 8192 个 token 的单卡打包预算，MoE 分块为 512/1024。指定 `ROLLOUT_MAX_RESPONSE_LEN=4096` 可缩短回答。两个示例都使用 `deepscaler` 奖励函数，可通过 `RM_TYPE` 覆盖。
 
-Packed documents are handled separately in BSH layout, avoiding dependence on
-the SDK's version-specific TND output capacity layout. Empty documents and
-prefixes shorter than one complete pool are handled explicitly. Contiguous
-allgather-CP gathers hidden states in document order and keeps queries local;
-this communicates more data than the reference projected-key/gate gather.
-Other CP partition layouts are not covered by this adapter.
-
-The current CANN build leaves reserved causal-tail slots empty. The adapter
-explicitly appends the original model's causal incomplete-pool token indices,
-and pads the final index width to a multiple of 64 for SparseMLA.
-
-NPU tests: `tests/test_glm5_next_ascendc_kpool.py`. They compare pooled values,
-selected token sets (order is not significant), completeness, uniqueness,
-document boundaries, and causality for full and CP-sliced queries.
-
-
-## Ascend clipped SwiGLU
-
-On NPU, the text ClampedSwiGLU and the vision MLP/merger use the shared
-`ops.swiglu_with_limit` helper. Following official MindSpeed-Bridge commit
-`f74d52a8a318c4594202ccdcf96a615b1f2d32da` (GLM vision modelling/swiglu.py),
-it clamps gate only above the limit and up on both sides, then calls
-`torch_npu.npu_swiglu`. CANN fuses SiLU and multiplication; clamp remains
-outside the fused operator. No new custom operator library is installed.
-
-The native model previously evaluated this activation in FP32. That arithmetic
-and the final cast to the input dtype are retained, unlike Bridge's direct
-input-dtype path. CANN/PyTorch autograd handles the backward and clamp-boundary
-derivatives. `GLM53_SWIGLU_BACKEND=torch` restores the reference implementation;
-the default remains `torch` pending end-to-end consistency validation.
-Use `GLM53_SWIGLU_BACKEND=ascendc` only for explicit fused validation.
-CPU/GPU keep the reference arithmetic.
-
-NPU regression tests: `tests/test_glm5_next_ascendc_swiglu.py`, covering FP32,
-FP16, BF16, exact clamp boundaries, empty token batches, noncontiguous inputs,
-and both forward outputs and input gradients. These checks establish numerical
-correctness, not a full-model speed or memory improvement.
+```bash
+export PROMPT_DATA=/path/to/dapo-math/train.jsonl
+unset MULTIMODAL_KEYS CHAT_TEMPLATE_KWARGS
+bash scripts/run-glm5.3-flash-npu.sh --dapo-math
+```

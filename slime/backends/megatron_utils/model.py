@@ -29,6 +29,7 @@ try:
 except ImportError:
     from megatron.core.utils import unwrap_model
 from slime.observability import logging_utils, train_metric_utils
+from slime.observability.profile_utils import npu_train_step_profile
 from slime.utils import accelerator
 from slime.utils.memory_utils import clear_memory
 
@@ -36,6 +37,7 @@ from .checkpoint import load_checkpoint, save_checkpoint
 from .data import DataIterator, get_batch
 from .loss import ROLLOUT_TOP_P_TOKEN_KEYS, get_rollout_top_p_logprob_kwargs, loss_function
 from .model_provider import get_model_provider_func
+from .pipeline_shapes import prepare_pipeline_shapes
 from .stateless_adam import StatelessAdam
 
 logger = logging.getLogger(__name__)
@@ -665,15 +667,11 @@ def train_one_step(
         if os.environ.get("ENABLE_ROUTING_REPLAY", "0") == "1":
             os.environ["ROUTING_REPLAY_STAGE"] = old_stage
 
-        if os.environ.get("GLM53_PROFILE_MICROBATCHES", "0") not in ("", "0"):
-            import glm53_train_profiler
-
-            glm53_train_profiler.on_microbatch()
-
         return output_tensor, partial(loss_function, args, batch, num_microbatches, step_global_batch_size)
 
     # Forward pass.
     forward_backward_func = get_forward_backward_func()
+    pipeline_kwargs = prepare_pipeline_shapes(args, model, data_iterator, num_microbatches)
     losses_reduced = forward_backward_func(
         forward_step_func=_wrap_forward_step_with_microbatch_pbar(forward_step, microbatch_pbar),
         data_iterator=data_iterator,
@@ -683,7 +681,10 @@ def train_one_step(
         micro_batch_size=args.micro_batch_size,
         decoder_seq_length=args.decoder_seq_length,
         forward_only=False,
+        **pipeline_kwargs,
     )
+    if pipeline_kwargs:
+        pipeline_kwargs["p2p_communicator"].assert_complete()
 
     valid_step = True
     grad_norm = float("nan")
@@ -861,18 +862,19 @@ def train(
     for step_id in range(num_steps_per_rollout):
 
         # Run training step.
-        loss_dict, grad_norm = train_one_step(
-            args,
-            rollout_id,
-            step_id,
-            data_iterator,
-            model,
-            optimizer,
-            opt_param_scheduler,
-            num_microbatches[step_id],
-            global_batch_sizes[step_id],
-            microbatch_pbar=microbatch_pbar,
-        )
+        with npu_train_step_profile(rollout_id * num_steps_per_rollout + step_id + 1):
+            loss_dict, grad_norm = train_one_step(
+                args,
+                rollout_id,
+                step_id,
+                data_iterator,
+                model,
+                optimizer,
+                opt_param_scheduler,
+                num_microbatches[step_id],
+                global_batch_sizes[step_id],
+                microbatch_pbar=microbatch_pbar,
+            )
 
         if step_id == 0:
             # Enable forward pre-hook after training step has successfully run. All subsequent

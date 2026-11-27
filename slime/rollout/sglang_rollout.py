@@ -20,6 +20,7 @@ from slime.observability.trace_utils import build_sglang_meta_trace_attrs, trace
 from slime.rollout.base_types import RolloutFnEvalOutput, RolloutFnTrainOutput, finalize_rollout_groups
 from slime.rollout.filter_hub.base_types import MetricGatherer, call_dynamic_filter, should_drop_dynamic_filter_output
 from slime.rollout.sample_hooks import apply_rollout_sample_hooks
+from slime.utils import accelerator
 from slime.utils.async_utils import AsyncPacer, run
 from slime.utils.data import Dataset
 from slime.utils.eval_config import EvalDatasetConfig
@@ -168,8 +169,8 @@ async def generate(args: Namespace, sample: Sample, sampling_params: dict[str, A
     state = GenerateState(args)
     router_url = f"http://{args.sglang_router_ip}:{args.sglang_router_port}"
     url = f"{router_url}/generate"
-    if args.use_rollout_routing_replay:
-        # This installed gateway drops return_routed_experts during request
+    if args.use_rollout_routing_replay and accelerator.device_type() == "npu":
+        # The NPU gateway drops return_routed_experts during request
         # deserialization. With exactly one regular worker, direct dispatch
         # preserves the R3 payload without changing worker selection.
         workers = (await get(f"{router_url}/workers"))["workers"]
@@ -289,10 +290,9 @@ async def generate(args: Namespace, sample: Sample, sampling_params: dict[str, A
         if invalid:
             logger.error(
                 "Invalid generation log-probs: sample=%s endpoint=%s "
-                "finish_reason=%r completion_tokens=%s invalid=%r response_prefix=%r",
+                "finish_reason=%r completion_tokens=%s invalid=%r",
                 sample.index, url, output["meta_info"].get("finish_reason"),
                 output["meta_info"].get("completion_tokens"), invalid[:16],
-                output.get("text", "")[:512],
             )
             raise ValueError("SGLang returned missing or non-finite sampled-token log-probs")
         new_response_tokens = [item[1] for item in entries]
@@ -302,8 +302,6 @@ async def generate(args: Namespace, sample: Sample, sampling_params: dict[str, A
 
     if args.use_rollout_routing_replay and output["meta_info"].get("routed_experts") is None:
         raise RuntimeError(f"R3 response from {url} is missing routed_experts for sample {sample.index}")
-    if args.use_rollout_routing_replay:
-        logger.info("ROUTING_REPLAY_RECEIVED sample=%s endpoint=%s", sample.index, url)
 
     sample.append_response_tokens(
         args,
@@ -383,7 +381,6 @@ async def generate_and_rm(
                 "generate_function": sample.generate_function_path or args.custom_generate_function_path,
                 "input_index": sample.index,
                 "input_group_index": sample.group_index,
-                "branch": getattr(sample, "_queue_branch", None),
             }
         ]
 

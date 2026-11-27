@@ -16,6 +16,8 @@ class Glm5NextModel(MegatronModule):
         super().__init__(config=config)
         self.pre_process = pre_process
         self.post_process = post_process
+        # Schedules and slime's stage-aware helpers inspect the outer VLM.
+        self.vp_stage = vp_stage
         self.image_token_id = hf_config.image_token_id
         self.video_token_id = hf_config.video_token_id
         self.language_model = GPTModel(
@@ -30,6 +32,7 @@ class Glm5NextModel(MegatronModule):
             position_embedding_type="none",
             vp_stage=vp_stage,
         )
+        self.pg_collection = self.language_model.pg_collection
         self.model = torch.nn.Module()
         if pre_process:
             hf_config.vision_config._attn_implementation = "sdpa"
@@ -87,15 +90,6 @@ class Glm5NextModel(MegatronModule):
                 if grids is None:
                     raise ValueError("GLM5-next pixel values require grid_thw")
                 features = self.model.visual(values.to(decoder_input.dtype), grid_thw=grids).pooler_output
-                if not getattr(self, "_visual_input_verified", False):
-                    import logging
-                    logging.getLogger(__name__).info(
-                        "VISUAL_INPUT_VERIFIED pixel_values=%s grid=%s image_tokens=%d features=%d",
-                        tuple(values.shape), grids.tolist(),
-                        int((full_input_ids == token).sum().item()), features.shape[0],
-                    )
-                    self._visual_input_verified = True
-
                 mask = input_ids.transpose(0, 1) == token
                 full_mask = full_input_ids[0] == token
                 if full_mask.sum().item() != features.shape[0]:
@@ -123,8 +117,15 @@ class Glm5NextModel(MegatronModule):
 def get_glm5_next_model_provider(args, config, vp_stage):
     hf_config = load_hf_config(args.hf_checkpoint, trust_remote_code=True)
     spec = get_glm5_next_spec(args, config, vp_stage)
+    spec_vp_stage = vp_stage
 
     def model_provider(pre_process=True, post_process=True, vp_stage=None):
+        if vp_stage is None:
+            vp_stage = spec_vp_stage
+        if vp_stage != spec_vp_stage:
+            raise ValueError(
+                f"GLM5-next spec belongs to virtual stage {spec_vp_stage}, got {vp_stage}"
+            )
         return Glm5NextModel(
             config, spec, hf_config, args, pre_process=pre_process, post_process=post_process, vp_stage=vp_stage
         )

@@ -28,6 +28,10 @@ def get_local_gpu_id():
 
 class TrainRayActor(RayActor):
     def __init__(self, world_size, rank, master_addr, master_port):
+        if os.environ.get("TMS_INIT_ENABLE") == "1" and accelerator.is_npu_environment():
+            from slime.ray.npu_worker import setup
+
+            setup()
         configure_logger()
 
         self._world_size = world_size

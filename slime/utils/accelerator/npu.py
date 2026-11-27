@@ -7,7 +7,6 @@ Importing this module never imports ``torch_npu``. The runtime bootstrap in
 from __future__ import annotations
 
 import importlib
-
 from typing import Any
 
 import torch
@@ -45,12 +44,15 @@ class NPUAccelerator(TorchAccelerator):
         return is_npu_available()
 
     def post_import_torch(self) -> None:
-        """Load the optional Ascend Megatron adapter after torch_npu bootstrap."""
+        """Load Ascend's Megatron compatibility shim after torch_npu setup."""
         try:
             importlib.import_module("megatron_adaptor")
         except ModuleNotFoundError as exc:
             if exc.name != "megatron_adaptor":
                 raise
+            # The shim is supplied by the Ascend Megatron stack. Keep Slime
+            # importable when that optional dependency is not installed.
+            return
 
     def weight_update_backend(self, default: str = "nccl") -> str:
         return "cpu:gloo,npu:hccl" if default == "nccl" else default
@@ -64,7 +66,16 @@ class NPUAccelerator(TorchAccelerator):
         is_capturing = getattr(module, "is_current_stream_capturing", None)
         if is_capturing is not None and is_capturing():
             return
-        module.empty_cache()
+        try:
+            module.empty_cache()
+        except RuntimeError as exc:
+            # Ascend's allocator tracks graph captures across streams.  The
+            # current-stream query above can therefore be false while a
+            # capture is still winding down elsewhere in the process.
+            # Releasing the cache is optional here; retrying it would only
+            # turn a successful weight transfer into a hard failure.
+            if "captures_underway.empty()" not in str(exc):
+                raise
 
     def supports(self, capability: str) -> bool:
         if capability in {"cuda_int4_extension", "nvml_affinity", "sglang_fp8_utils", "triton_kernels"}:

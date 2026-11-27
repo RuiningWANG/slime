@@ -6,6 +6,12 @@ from .deepseekv3 import convert_deepseekv3_to_hf
 
 def convert_glm5_next_to_hf(args, name, param):
     name = strip_mcore_wrappers(name)
+    if name == "model.visual.merger.gate_up_proj.weight":
+        gate, up = param.chunk(2, dim=0)
+        return [("model.visual.merger.gate_proj.weight", gate),
+                ("model.visual.merger.up_proj.weight", up)]
+    if name.startswith("model.visual."):
+        return [(name, param)]
     match = re.fullmatch(r"decoder\.layers\.(\d+)\.(.+)", name)
     if match:
         layer, rest = match.groups()

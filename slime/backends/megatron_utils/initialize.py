@@ -15,6 +15,33 @@ from transformers.utils import HF_MODULES_CACHE
 logger = logging.getLogger(__name__)
 
 
+def _install_npu_cuda_compat():
+    """Bridge Megatron's small CUDA API surface to torch.npu on NPU workers."""
+    npu = getattr(torch, "npu", None)
+    cuda = getattr(torch, "cuda", None)
+    if npu is None or cuda is None:
+        return
+    try:
+        if cuda.is_available():
+            return
+    except Exception:
+        return
+    for name in (
+        "current_device",
+        "device_count",
+        "set_device",
+        "manual_seed",
+        "manual_seed_all",
+        "get_rng_state",
+        "set_rng_state",
+        "synchronize",
+        "empty_cache",
+    ):
+        implementation = getattr(npu, name, None)
+        if implementation is not None:
+            setattr(cuda, name, implementation)
+
+
 def _set_random_seed(
     seed_: int,
     data_parallel_random_init: bool = False,
@@ -58,6 +85,7 @@ def _initialize_distributed(args, get_embedding_ranks=None, get_position_embeddi
 
 
 def init(args):
+    _install_npu_cuda_compat()
     set_args(args)
     if args.enable_experimental:
         logger.info("Enable megatron experimental")

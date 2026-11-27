@@ -3,7 +3,6 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import os
 
 from megatron.core.tensor_parallel.mappings import gather_from_sequence_parallel_region
 from slime.utils import accelerator
@@ -12,7 +11,6 @@ if accelerator.device_type() == "npu":
     from .npu_backend import (
         FusedRMSNormGated,
         ShortConvolution,
-        SparseMLA,
         build_cp_context,
         causal_conv1d,
         chunk_kda,
@@ -35,6 +33,10 @@ class RMSNorm(nn.Module):
         self.eps = eps
 
     def forward(self, x):
+        if x.device.type == "npu":
+            import torch_npu
+
+            return torch_npu.npu_rms_norm(x, self.weight, epsilon=self.eps)[0]
         normalized = x.float() * torch.rsqrt(x.float().square().mean(-1, keepdim=True) + self.eps)
         return (normalized * self.weight.float()).to(x.dtype)
 
@@ -140,36 +142,32 @@ class PooledIndexer(nn.Module):
         # MLA-noPE also disables indexer RoPE. The checkpoint already uses
         # SGLang/HF's channel order, so no half-channel permutation is needed.
         index_q = self.wq_b(q).view(-1, self.heads, self.dim)
-        backend = os.environ.get("GLM53_KPOOL_BACKEND", "torch") if x.device.type == "npu" else "torch"
-        if backend not in ("torch", "ascendc"):
-            raise ValueError(f"Unsupported GLM53_KPOOL_BACKEND: {backend}")
-        if backend == "ascendc" and x.device.type == "npu":
-            from .ascendc_kpool import fused_kpool_indexer
+        projected_key = self.wk(x)
+        weights = F.linear(x.float(), self.weights_proj.weight.float())
+        if x.device.type == "npu":
+            from .sglang_kpool import pooled_indexer_topk as select_indices
 
-            weights = F.linear(x.float(), self.weights_proj.weight.float()) * (self.heads * self.dim) ** -0.5
-            cp_size = cp_group.size() if cp_group is not None else 1
-            cp_rank = cp_group.rank() if cp_group is not None else 0
-            full_x = gather_from_sequence_parallel_region(x, group=cp_group) if cp_size > 1 else x
-            return fused_kpool_indexer(
-                index_q, full_x.reshape(-1, full_x.shape[-1]), weights.reshape(-1, self.heads),
-                self.wk.weight, self.index_kpool_compress_gate, self.index_kpool_compress_ape,
-                self.k_norm.weight, self.k_norm.bias, self.k_norm.eps,
-                packed_seq_params.cu_seqlens_q, self.topk, self.pool_size,
-                query_start=cp_rank * x.shape[0],
-            )
-        index_k = self.k_norm(self.wk(x))
-        weights = F.linear(x.float(), self.weights_proj.weight.float()) * (self.heads * self.dim) ** -0.5
+            index_k = F.layer_norm(
+                projected_key.float(), (self.dim,), self.k_norm.weight.float(),
+                self.k_norm.bias.float(), self.k_norm.eps,
+            ).to(projected_key.dtype)
+            # SGLang rounds head-scaled weights before the kernel applies the dimension scale.
+            weights = (weights * self.heads ** -0.5).to(torch.bfloat16)
+        else:
+            select_indices = pooled_indexer_topk
+            index_k = self.k_norm(projected_key)
+            weights = weights * (self.heads * self.dim) ** -0.5
         gates = F.linear(x, self.index_kpool_compress_gate)
         cp_size = cp_group.size() if cp_group is not None else 1
         cp_rank = cp_group.rank() if cp_group is not None else 0
         if cp_size > 1:
             pooled_inputs = gather_from_sequence_parallel_region(torch.cat([index_k, gates], dim=-1), group=cp_group)
             index_k, gates = pooled_inputs.chunk(2, dim=-1)
-        return pooled_indexer_topk(
+        return select_indices(
             index_q,
-            index_k,
-            weights,
-            gates,
+            index_k.reshape(-1, self.dim),
+            weights.reshape(-1, self.heads),
+            gates.reshape(-1, self.dim),
             self.index_kpool_compress_ape,
             packed_seq_params.cu_seqlens_q,
             self.topk,
@@ -195,11 +193,19 @@ class NopeDSAttention(nn.Module):
         self.o_proj = nn.Linear(self.heads * self.v_dim, config.hidden_size, bias=False)
         self.indexer = PooledIndexer(hf_config)
 
+    def _project_qkv(self, x):
+        # Keep separate Parameters/checkpoint keys while matching inference's
+        # Q-then-KV row order and single GEMM. Rebuild from current weights so
+        # optimizer updates and autograd remain valid; do not cache a detached copy.
+        weight = torch.cat((self.q_a_proj.weight, self.kv_a_proj_with_mqa.weight), dim=0)
+        return F.linear(x, weight).split((self.q_a_proj.out_features, self.kv_rank), dim=-1)
+
     def forward(self, hidden_states, packed_seq_params=None, **kwargs):
         x = hidden_states.squeeze(1)
-        q_latent = self.q_a_layernorm(self.q_a_proj(x))
+        q_a, kv_a = self._project_qkv(x)
+        q_latent = self.q_a_layernorm(q_a)
         q = self.q_b_proj(q_latent).view(-1, self.heads, self.qk_dim)
-        kv = self.kv_a_layernorm(self.kv_a_proj_with_mqa(x))
+        kv = self.kv_a_layernorm(kv_a)
         wk, wv = self.kv_b_proj.weight.view(self.heads, self.qk_dim + self.v_dim, self.kv_rank).split(
             (self.qk_dim, self.v_dim), dim=1
         )
@@ -211,8 +217,9 @@ class NopeDSAttention(nn.Module):
             kv = gather_from_sequence_parallel_region(kv, group=self.cp_group)
         indices = self.indexer(x, q_latent, packed_seq_params, self.cp_group)
         if q.device.type == "npu":
-            # CANN no-RoPE MLA takes the absorbed 512-channel tensors directly.
-            out, _ = SparseMLA.apply(q, kv[:, None], indices, self.qk_dim**-0.5)
+            from .ascendc_sparse_attention import sparse_attention
+
+            out = sparse_attention(q, kv[:, None], indices, self.qk_dim**-0.5)
         else:
             # Preserve the original GPU SparseMLA 512+64 layout.
             out, _ = SparseMLA.apply(F.pad(q, (0, 64)), F.pad(kv[:, None], (0, 64)), indices, self.qk_dim**-0.5)

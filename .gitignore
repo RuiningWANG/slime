@@ -198,16 +198,3 @@ _examples_synced/
 # Local straw verification output and cross-project coordination
 /benchmark-results/
 /STRAW_COORDINATION.md
-
-# GLM5.3 local machine settings and run artifacts
-/deployment/machine.env
-/logs/
-/tensorboard_log/
-/dependencies/
-*.bundle
-
-# GLM5.3 generated diagnostics and local backup artifacts.
-/extra-info/
-*.bak
-*.bak-*
-*.bak.*

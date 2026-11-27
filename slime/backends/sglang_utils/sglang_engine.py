@@ -3,16 +3,19 @@ import ipaddress
 import logging
 import multiprocessing
 import os
-import re
 import sys
 import time
 
 import requests
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import kill_process_tree
 from urllib3.exceptions import NewConnectionError
 
 from slime.backends.sglang_utils.external import get_server_info
+from slime.backends.sglang_utils.runtime import (
+    launch_server_subprocess,
+    prepare_server_environment,
+    terminate_server_process,
+)
 from slime.backends.sglang_utils.server_control import unregister_worker
 from slime.ray.ray_actor import RayActor
 from slime.utils import accelerator
@@ -20,6 +23,17 @@ from slime.utils.http_utils import get_host_info
 from slime.utils.model_config import sglang_model_config_overrides
 
 logger = logging.getLogger(__name__)
+
+
+def admin_auth_headers():
+    try:
+        import sglang.srt.utils.auth as auth
+    except ModuleNotFoundError as exc:
+        if exc.name != "sglang.srt.utils.auth":
+            raise
+        return {}
+    get_headers = getattr(auth, "admin_auth_headers", None)
+    return get_headers() if get_headers is not None else {}
 
 
 def get_base_gpu_id(args, rank):
@@ -32,28 +46,12 @@ def get_base_gpu_id(args, rank):
     return start_index
 
 
-def prepare_server_environment(environ):
-    """Remove unsupported allocator settings and avoid Mooncake/HTTP port collisions."""
-    for name in ("PYTORCH_CUDA_ALLOC_CONF", "PYTORCH_ALLOC_CONF"):
-        value = environ.get(name)
-        if value is None:
-            continue
-        value = re.sub(r"(^|,)\s*expandable_segments\s*:\s*(?:True|False|true|false|1|0)(?=,|$)", "", value).strip(
-            ", "
-        )
-        if value:
-            environ[name] = value
-        else:
-            environ.pop(name, None)
-
-    # Preserve explicit ranges, including Mooncake's legacy PRC spelling.
-    if not any(f"MC_{bound}_{spelling}_PORT" in environ for bound in ("MIN", "MAX") for spelling in ("RPC", "PRC")):
-        environ["MC_MIN_PRC_PORT"] = "27000"
-        environ["MC_MAX_PRC_PORT"] = "28000"
-
-
-
 def launch_server_process(server_args: ServerArgs) -> multiprocessing.Process:
+    # Expandable segments help the colocated training actor tolerate repeated
+    # cache releases, but SGLang's allocator/sleep path does not support them.
+    # The rollout Ray actor inherits the job environment, so remove the option
+    # before spawning every SGLang server and its children. Preserve pinned-host
+    # allocation settings and the existing Mooncake port-range defaults.
     prepare_server_environment(os.environ)
 
     if getattr(server_args, "encoder_only", False):
@@ -122,11 +120,11 @@ def _prepare_server_stdin():
     sys.stdin = os.fdopen(0, "r", closefd=False)
 
 
-
 def _wait_server_healthy(base_url, api_key, is_process_alive, wait_for_metadata=False):
     headers = {
         "Content-Type": "application/json; charset=utf-8",
         "Authorization": f"Bearer {api_key}",
+        **admin_auth_headers(),
     }
 
     with requests.Session() as session:
@@ -248,7 +246,17 @@ class SGLangEngine(RayActor):
             server_args_dict["model_path"], server_args_dict.get("json_model_override_args", "{}")
         )
         logger.info(f"Launch HttpServerEngineAdapter at: {self.server_host}:{self.server_port}")
-        self.process = launch_server_process(ServerArgs(**server_args_dict))
+        executable = getattr(self.args, "sglang_python_executable", None)
+        if executable:
+            self.process = launch_server_subprocess(executable, server_args_dict)
+            if self.node_rank == 0:
+                _wait_server_healthy(
+                    base_url=f"http://{self.server_host}:{self.server_port}",
+                    api_key=server_args_dict.get("api_key"),
+                    is_process_alive=lambda: self.process.poll() is None,
+                )
+        else:
+            self.process = launch_server_process(ServerArgs(**server_args_dict))
         self._register_to_router(server_args_dict)
 
     def _register_to_router(self, server_args_dict):
@@ -304,7 +312,9 @@ class SGLangEngine(RayActor):
             return
 
         url = f"http://{self.server_host}:{self.server_port}/{endpoint}"
-        response = requests.post(url, json=payload or {}, timeout=timeout)
+        response = requests.post(
+            url, json=payload or {}, headers=admin_auth_headers(), timeout=timeout
+        )
         try:
             response.raise_for_status()
         except requests.exceptions.HTTPError as e:
@@ -329,10 +339,17 @@ class SGLangEngine(RayActor):
 
         response = requests.get(
             f"http://{self.server_host}:{self.server_port}/health_generate",
+            headers=admin_auth_headers(),
             timeout=timeout,
         )
         response.raise_for_status()
         return True
+
+    def begin_weight_update(self):
+        return self._make_request("begin_weight_update", {})
+
+    def end_weight_update(self):
+        return self._make_request("end_weight_update", {})
 
     def update_weights_from_tensor(
         self,
@@ -366,7 +383,10 @@ class SGLangEngine(RayActor):
         # flush cache will not return status_code 200 when there are pending requests
         for _ in range(60):
             try:
-                response = requests.get(f"http://{self.server_host}:{self.server_port}/flush_cache")
+                response = requests.get(
+                    f"http://{self.server_host}:{self.server_port}/flush_cache",
+                    headers=admin_auth_headers(),
+                )
                 if response.status_code == 200:
                     break
                 logger.info(f"Error flushing cache: HTTP {response.status_code} {response.text!r}")
@@ -403,17 +423,21 @@ class SGLangEngine(RayActor):
                 # Even if router cleanup fails, terminate the local process.
                 # Owner-side cleanup keeps the URL outside this actor for retry.
                 logger.warning(f"Failed to fetch workers list or remove worker: {e}")
-        kill_process_tree(self.process.pid)
+        terminate_server_process(self.process)
 
     def get_weight_version(self):
         if self.node_rank != 0:
             return
         url = f"http://{self.server_host}:{self.server_port}/get_weight_version"
-        response = requests.get(url, timeout=self.args.rollout_health_check_timeout)
+        response = requests.get(
+            url, headers=admin_auth_headers(), timeout=self.args.rollout_health_check_timeout
+        )
         if response.status_code in (404, 405):
             # Use model_info when the weight-version endpoint is unavailable.
             url = f"http://{self.server_host}:{self.server_port}/model_info"
-            response = requests.get(url, timeout=self.args.rollout_health_check_timeout)
+            response = requests.get(
+                url, headers=admin_auth_headers(), timeout=self.args.rollout_health_check_timeout
+            )
         response.raise_for_status()
         return response.json()["weight_version"]
 
@@ -537,14 +561,20 @@ class SGLangEngine(RayActor):
     def pause_generation(self, mode: str = "abort"):
         if self.node_rank != 0:
             return
-        response = requests.post(f"http://{self.server_host}:{self.server_port}/pause_generation", json={"mode": mode})
+        response = requests.post(
+            f"http://{self.server_host}:{self.server_port}/pause_generation",
+            json={"mode": mode}, headers=admin_auth_headers(),
+        )
         response.raise_for_status()
         return response
 
     def continue_generation(self):
         if self.node_rank != 0:
             return
-        response = requests.post(f"http://{self.server_host}:{self.server_port}/continue_generation", json={})
+        response = requests.post(
+            f"http://{self.server_host}:{self.server_port}/continue_generation",
+            json={}, headers=admin_auth_headers(),
+        )
         response.raise_for_status()
         return response
 
@@ -580,11 +610,13 @@ class SGLangEngine(RayActor):
         profile_by_stage: bool = False,
         with_stack: bool | None = None,
         record_shapes: bool | None = None,
+        npu_profile_tp_rank: int | None = None,
     ):
         if self.node_rank != 0:
             return
         response = requests.post(
             f"http://{self.server_host}:{self.server_port}/start_profile",
+            headers=admin_auth_headers(),
             json={
                 "output_dir": output_dir,
                 "start_step": start_step,
@@ -593,6 +625,7 @@ class SGLangEngine(RayActor):
                 "profile_by_stage": profile_by_stage,
                 "with_stack": with_stack,
                 "record_shapes": record_shapes,
+                "npu_profile_tp_rank": npu_profile_tp_rank,
             },
         )
         response.raise_for_status()
@@ -601,7 +634,10 @@ class SGLangEngine(RayActor):
     def stop_profile(self):
         if self.node_rank != 0:
             return
-        response = requests.post(f"http://{self.server_host}:{self.server_port}/stop_profile", json={})
+        response = requests.post(
+            f"http://{self.server_host}:{self.server_port}/stop_profile",
+            json={}, headers=admin_auth_headers(),
+        )
         response.raise_for_status()
         return response
 

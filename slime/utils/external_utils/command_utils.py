@@ -54,7 +54,7 @@ def convert_checkpoint(
 
     exec_command(
         f"source {repo_base_dir}/scripts/models/{megatron_model_type}.sh && "
-        f"PYTHONPATH=/workspace/Megatron-LM:/workspace/Megatron-Bridge/src:/workspace/MegatronAdaptor:/workspace/TransformerEngineNPU:${{PYTHONPATH:-}} "
+        f"PYTHONPATH={os.environ.get('SLIME_MEGATRON_ROOT', '/workspace/Megatron-LM')}:/workspace/Megatron-Bridge/src:/workspace/MegatronAdaptor:/workspace/TransformerEngineNPU:$PYTHONPATH "
         f"torchrun "
         f"--nproc-per-node {num_gpus_per_node} "
         f"{multinode_args}"
@@ -97,6 +97,7 @@ def execute_train(
     train_args: str,
     num_gpus_per_node: int,
     megatron_model_type: str | None,
+    train_script: str = "train.py",
     before_ray_job_submit=None,
     extra_env_vars=None,
     config: ExecuteTrainConfig | None = None,
@@ -113,28 +114,33 @@ def execute_train(
     # Launching another trainer must preserve independently owned serving.
     # Successful training cleans up its own resources; failures retain them.
     if not external_ray:
-        # A manual trainer restart must leave the Ray head and its detached
-        # rollout session alive. A stale address file alone is not proof of a
-        # running cluster, so query the head before deciding to start one.
-        ray_running = (
-            subprocess.run(
-                ["ray", "status"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30
-            ).returncode
-            == 0
+        resource_name = accelerator.ray_resource_name()
+        device_resources = (
+            f"--num-gpus {num_gpus_per_node}"
+            if resource_name == "GPU"
+            else f"--resources='{{\"{resource_name}\": {num_gpus_per_node}}}'"
         )
-        if not ray_running:
-            resource_name = accelerator.ray_resource_name()
-            device_resources = (
-                f"--num-gpus {num_gpus_per_node}"
-                if resource_name == "GPU"
-                else f"--resources='{{\"{resource_name}\": {num_gpus_per_node}}}'"
+        # A manual trainer restart must leave the Ray head and its detached
+        # rollout session alive. Query it before starting a new head.
+        try:
+            ray_running = (
+                subprocess.run(
+                    ["ray", "status"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30
+                ).returncode
+                == 0
             )
+        except subprocess.TimeoutExpired:
+            ray_running = False
+        if not ray_running:
+            ray_num_cpus = os.environ.get("SLIME_RAY_NUM_CPUS")
+            cpu_resources = f"--num-cpus {int(ray_num_cpus)}" if ray_num_cpus else ""
             exec_command(
-                # will prevent ray from buffering stdout/stderr
                 f"export PYTHONUNBUFFERED=1 && "
                 f"ray start --head --node-ip-address {master_addr} --port {ray_port} "
-                f"--dashboard-port {ray_dashboard_port} {device_resources} --disable-usage-stats"
+                f"--dashboard-port {ray_dashboard_port} {device_resources} {cpu_resources} --disable-usage-stats"
             )
+            # `ray start` can return before the dashboard job agent registers.
+            time.sleep(5)
 
     if (f := before_ray_job_submit) is not None:
         f()
@@ -142,8 +148,8 @@ def execute_train(
     runtime_env_json = json.dumps(
         {
             "env_vars": {
-                "PYTHONPATH": f"/workspace/Megatron-LM:/workspace/Megatron-Bridge/src:/workspace/MegatronAdaptor:/workspace/TransformerEngineNPU:{os.environ.get('PYTHONPATH', '')}",
-                "RAY_USE_UVLOOP": "0",
+                "PYTHONPATH": f"{os.environ.get('SLIME_MEGATRON_ROOT', '/workspace/Megatron-LM')}:/workspace/Megatron-Bridge/src:/workspace/MegatronAdaptor:/workspace/TransformerEngineNPU:{os.environ.get('PYTHONPATH', '')}",
+                "SLIME_ENABLE_PROFILING": "False",
                 "RAY_EXPERIMENTAL_NOSET_ASCEND_RT_VISIBLE_DEVICES": "1",
                 "RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO": "0",
                 "RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES": "1",
@@ -181,6 +187,13 @@ def execute_train(
     )
 
     if get_bool_env_var("SLIME_SCRIPT_ENABLE_RAY_SUBMIT", "1"):
+        # Older async test scripts pass train_async.py.  Upstream now keeps
+        # one training entrypoint and selects fully-async behavior through
+        # --rollout-function-path; preserve the old test contract by mapping
+        # the removed wrapper to train.py only when it is absent.
+        launch_script = train_script
+        if launch_script == "train_async.py" and not (repo_base_dir / launch_script).exists():
+            launch_script = "train.py"
         cmd_megatron_model_source = (
             f'source "{repo_base_dir}/scripts/models/{megatron_model_type}.sh" && '
             if megatron_model_type is not None
@@ -191,7 +204,7 @@ def execute_train(
             f"{cmd_megatron_model_source}"
             f'ray job submit --address="http://127.0.0.1:{ray_dashboard_port}" '
             f"--runtime-env-json='{runtime_env_json}' "
-            f"-- python3 train.py "
+            f"-- python3 {repo_base_dir}/{launch_script} "
             f"{'${MODEL_ARGS[@]}' if megatron_model_type is not None else ''} "
             f"{train_args}"
         )

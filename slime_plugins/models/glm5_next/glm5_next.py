@@ -6,9 +6,11 @@ import os
 import torch
 from megatron.core.extensions.transformer_engine_spec_provider import TESpecProvider
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_decoder_block_spec, get_mlp_module_spec_for_backend
+from megatron.core.transformer.enums import LayerType
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_layer import TransformerLayer, get_transformer_layer_offset
 
+from slime.utils import accelerator
 from slime.utils.model_config import load_hf_config
 
 from .attention import KimiDeltaAttention, NopeDSAttention
@@ -25,6 +27,14 @@ class Glm5NextLayer(TransformerLayer):
         super().__init__(*args, **kwargs)
         self.hf_config = hf_config
         if hasattr(self.mlp, "experts"):
+            if accelerator.device_type() == "npu" and not getattr(hf_config, "router_fp32", False):
+                from .router import install_inference_aligned_router
+
+                install_inference_aligned_router(self.mlp.router)
+            if accelerator.device_type() == "npu":
+                from .moe_weighting import install_inference_aligned_weighting
+
+                install_inference_aligned_weighting(self.mlp, hf_config.routed_scaling_factor)
             from .moe_chunking import install_moe_chunking
 
             install_moe_chunking(
@@ -92,6 +102,16 @@ class Glm5NextLayer(TransformerLayer):
 
 def get_glm5_next_spec(args, config, vp_stage):
     hf_config = load_hf_config(args.hf_checkpoint, trust_remote_code=True).text_config
+    if (
+        accelerator.device_type() == "npu"
+        and (config.virtual_pipeline_model_parallel_size or 1) > 1
+        and (not config.overlap_p2p_comm or config.batch_p2p_comm)
+    ):
+        raise ValueError(
+            "GLM5-next VPP on NPU requires overlap_p2p_comm=True and batch_p2p_comm=False: "
+            "blocking bidirectional shape exchange can deadlock with variable-length mHC payloads. "
+            "Keep Megatron's default VPP P2P overlap enabled."
+        )
     if config.tensor_model_parallel_size != 1:
         raise ValueError("GLM5-next native attention requires TP=1; use CP, PP and EP to shard the 300B model")
     if config.context_parallel_size > 1 and not args.allgather_cp:
@@ -100,22 +120,29 @@ def get_glm5_next_spec(args, config, vp_stage):
     config.bias_activation_fusion = False
     config.use_te_activation_func = True
     config.variable_seq_lengths = True  # Pipeline payloads carry all mHC streams.
+    config.glm53_pipeline_hidden_size = config.hidden_size * hf_config.hc_mult
     spec = get_gpt_decoder_block_spec(config, use_transformer_engine=True, vp_stage=vp_stage)
-    offset = get_transformer_layer_offset(config, vp_stage=vp_stage)
+    if config.pipeline_model_parallel_layout is not None:
+        layer_ids = config.pipeline_model_parallel_layout.get_layer_id_list(
+            layer_type=LayerType.decoder, vp_stage=vp_stage
+        )
+    else:
+        offset = get_transformer_layer_offset(config, vp_stage=vp_stage)
+        layer_ids = range(offset, offset + len(spec.layer_specs))
     kda_layers = set(hf_config.linear_attn_config["kda_layers"])
     backend = Glm5NextSpecProvider()
-    for index, layer in enumerate(spec.layer_specs):
+    for index, (layer_id, layer) in enumerate(zip(layer_ids, spec.layer_specs, strict=True)):
         layer = copy.deepcopy(layer)
         layer.module = Glm5NextLayer
         layer.params = {**(layer.params or {}), "hf_config": hf_config}
         layer.submodules.input_layernorm = backend.layer_norm()
         layer.submodules.self_attention = ModuleSpec(
-            module=KimiDeltaAttention if index + offset in kda_layers else NopeDSAttention,
+            module=KimiDeltaAttention if layer_id in kda_layers else NopeDSAttention,
             params={"hf_config": hf_config},
         )
         layer.submodules.mlp = get_mlp_module_spec_for_backend(
             backend,
-            num_experts=None if index + offset < hf_config.first_k_dense_replace else config.num_moe_experts,
+            num_experts=None if layer_id < hf_config.first_k_dense_replace else config.num_moe_experts,
             moe_grouped_gemm=config.moe_grouped_gemm,
             use_te_activation_func=True,
         )

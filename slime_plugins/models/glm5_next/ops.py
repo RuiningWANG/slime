@@ -1,36 +1,16 @@
 """Differentiable GLM-5.3 Flash operations (mcore_vlm-slime conventions)."""
 
-import os
-import logging
-from functools import lru_cache
-
 import torch
 import torch.nn.functional as F
 
-
-@lru_cache(maxsize=1)
-def _log_fused_swiglu():
-    logging.getLogger(__name__).info("GLM53_FUSED_SWIGLU backend=torch_npu fp32_compute=True")
+from .packed_sequence import packed_boundaries
 
 
 def swiglu_with_limit(x, limit):
-    """GLM clamp semantics with CANN SwiGLU, preserving FP32 activation math.
-
-    Reference: MindSpeed-Bridge f74d52a8, modelling_glm_vl/swiglu.py.
-    Unlike its input-dtype path, retain this model's existing FP32 arithmetic.
-    """
-    backend = os.environ.get("GLM53_SWIGLU_BACKEND", "torch")
-    if backend not in ("torch", "ascendc"):
-        raise ValueError(f"Unsupported GLM53_SWIGLU_BACKEND: {backend}")
+    """Clamped SwiGLU with FP32 arithmetic and the original output dtype."""
     gate, up = x.float().chunk(2, dim=-1)
     gate = gate.clamp(max=limit)
     up = up.clamp(-limit, limit)
-    if x.device.type == "npu" and backend == "ascendc" and x.numel():
-        import torch_npu
-
-        _log_fused_swiglu()
-        with torch.profiler.record_function("glm53::clamped_swiglu"):
-            return torch_npu.npu_swiglu(torch.cat((gate, up), dim=-1), dim=-1).to(x.dtype)
     return (F.silu(gate) * up).to(x.dtype)
 
 
@@ -49,17 +29,11 @@ class ClampedSwiGLU(torch.nn.Module):
         return self._forward(x)
 
     def _forward(self, x):
-        gate, up = x.float().chunk(2, dim=-1)
-        return (F.silu(gate.clamp(max=self.limit)) * up.clamp(-self.limit, self.limit)).to(x.dtype)
+        return swiglu_with_limit(x, self.limit)
 
 
 def _use_fused_mhc(x):
-    if x.device.type != "npu":
-        return False
-    backend = os.environ.get("GLM53_MHC_BACKEND", "torch")
-    if backend not in ("torch", "ascendc"):
-        raise ValueError(f"Unsupported GLM53_MHC_BACKEND: {backend}")
-    return backend == "ascendc" and x.device.type == "npu" and x.dtype == torch.bfloat16
+    return x.device.type == "npu" and x.dtype == torch.bfloat16
 
 
 def mhc_pre(x, weight, scale, bias, n, norm_eps, eps, iterations):
@@ -117,7 +91,11 @@ def pooled_indexer_topk(q, k, weights, gates, ape, cu_seqlens, topk, pool_size, 
     storage independently of the total sequence length. Indexer parameters
     are frozen, as in the reference RL recipe.
     """
-    boundaries = cu_seqlens.tolist()
+    if pool_size <= 0 or topk <= 0 or topk % pool_size:
+        raise ValueError("KPool topk must be positive and divisible by pool_size")
+    if query_start < 0 or query_start + q.shape[0] > k.shape[0]:
+        raise ValueError("KPool query interval lies outside the packed stream")
+    boundaries = packed_boundaries(cu_seqlens, k.shape[0])
     width = ((topk + pool_size - 1 + 63) // 64) * 64
     indices = torch.full((q.shape[0], 1, width), -1, dtype=torch.int32, device=q.device)
     offsets = torch.arange(pool_size, device=q.device)

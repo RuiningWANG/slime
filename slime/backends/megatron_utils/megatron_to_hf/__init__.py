@@ -22,6 +22,9 @@ def convert_to_hf(args, model_name, name, param, quantization_config=None, trans
     while hf_name.startswith("module."):
         hf_name = hf_name.removeprefix("module.")
     if hf_name.startswith("model.visual."):
+        normalized_model = model_name.lower().replace("_", "").replace("-", "")
+        if "glm5next" in normalized_model or "glm53" in normalized_model:
+            return convert_glm5_next_to_hf(args, hf_name, param)
         return [(hf_name, param)]
 
     param = remove_padding(name, param, args.vocab_size)

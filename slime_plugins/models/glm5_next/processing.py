@@ -1,4 +1,4 @@
-from sglang.srt.multimodal.glm5_next_processing import Glm5NextProcessor as ServingGlm5NextProcessor
+from transformers.models.glm5_next.processing_glm5_next import Glm5NextProcessor as ServingGlm5NextProcessor
 
 
 class Glm5NextProcessor(ServingGlm5NextProcessor):

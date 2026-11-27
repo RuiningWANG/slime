@@ -1,5 +1,7 @@
 import re
 
+import torch
+
 from .common import strip_mcore_wrappers
 from .deepseek import deepseek_hf_tensor
 
@@ -22,6 +24,11 @@ class _LanguageModelReader:
 
 def glm5_next_hf_tensor(name, reader, config):
     name = strip_mcore_wrappers(name)
+    if name == "model.visual.merger.gate_up_proj.weight" and name not in reader:
+        return torch.cat(
+            [reader.get_tensor("model.visual.merger.gate_proj.weight"),
+             reader.get_tensor("model.visual.merger.up_proj.weight")], dim=0
+        )
     if name.startswith("model.visual."):
         return reader.get_tensor(name)
     reader = _LanguageModelReader(reader)

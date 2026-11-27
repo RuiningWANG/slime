@@ -9,7 +9,11 @@ from megatron.core.packed_seq_params import PackedSeqParams
 from slime.utils import accelerator
 from slime.utils.types import RolloutBatch
 
-from .cp_utils import get_thd_partitioned_indices, pad_thd_sequences_for_cp, slice_with_cp
+from .cp_utils import (
+    get_thd_partitioned_indices,
+    pad_thd_sequences_for_cp,
+    slice_with_cp,
+)
 
 
 @dataclass
@@ -87,11 +91,33 @@ def get_batch(
 
         tokens = tokens.chunk(cp_size, dim=0)[cp_rank]
     elif cp_size > 1:
-        global_tokens, _, cu_seqlens_padded = pad_thd_sequences_for_cp(tokens, pad_token_id, cp_size, tp_size)
-        partition_indices = get_thd_partitioned_indices(cu_seqlens_padded, global_tokens.size(0), cp_size, cp_rank)
+        global_tokens, cu_seqlens, cu_seqlens_padded = pad_thd_sequences_for_cp(
+            tokens,
+            pad_token_id,
+            cp_size,
+            tp_size,
+        )
+        partition_indices = get_thd_partitioned_indices(
+            cu_seqlens_padded,
+            global_tokens.size(0),
+            cp_size,
+            cp_rank,
+        )
         tokens = global_tokens.index_select(0, partition_indices)
-        cu_seqlens_list = cu_seqlens_padded.tolist()
-        pad = 0
+
+        padded_lengths = cu_seqlens_padded[1:] - cu_seqlens_padded[:-1]
+        max_seqlen = padded_lengths.max().item()
+        packed_seq_params = PackedSeqParamsWithCPUOffsets(
+            cu_seqlens_q_cpu=tuple(cu_seqlens_padded.tolist()),
+            cu_seqlens_q=cu_seqlens_padded,
+            cu_seqlens_kv=cu_seqlens_padded,
+            cu_seqlens_q_padded=cu_seqlens_padded,
+            cu_seqlens_kv_padded=cu_seqlens_padded,
+            max_seqlen_q=max_seqlen,
+            max_seqlen_kv=max_seqlen,
+            qkv_format="thd",
+        )
+        pad = None
     else:
         tokens = [slice_with_cp(t, pad_token_id) for t in tokens]
 
@@ -110,18 +136,21 @@ def get_batch(
         # thd requires the cu_seqlens to be of the origin length
         cu_seqlens_list = [offset * cp_size for offset in cu_seqlens_list]
 
-    cu_seqlens = torch.tensor(cu_seqlens_list, dtype=torch.int, device=accelerator.device())
-    max_seqlen = max(end - start for start, end in zip(cu_seqlens_list[:-1], cu_seqlens_list[1:], strict=True))
-    packed_seq_params = PackedSeqParamsWithCPUOffsets(
-        cu_seqlens_q=cu_seqlens,
-        cu_seqlens_kv=cu_seqlens,
-        cu_seqlens_q_padded=cu_seqlens,
-        cu_seqlens_kv_padded=cu_seqlens,
-        cu_seqlens_q_cpu=tuple(cu_seqlens_list),
-        max_seqlen_q=max_seqlen,
-        max_seqlen_kv=max_seqlen,
-        qkv_format="thd",
-    )
+    if allgather_cp or cp_size == 1:
+        # Keep host offsets for the HuggingFace CP wrapper and padded offsets
+        # for the NPU THD attention path.
+        cu_seqlens = torch.tensor(cu_seqlens_list, dtype=torch.int, device=accelerator.device())
+        max_seqlen = max(end - start for start, end in zip(cu_seqlens_list[:-1], cu_seqlens_list[1:], strict=True))
+        packed_seq_params = PackedSeqParamsWithCPUOffsets(
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_kv=cu_seqlens,
+            cu_seqlens_q_padded=cu_seqlens,
+            cu_seqlens_kv_padded=cu_seqlens,
+            cu_seqlens_q_cpu=tuple(cu_seqlens_list),
+            max_seqlen_q=max_seqlen,
+            max_seqlen_kv=max_seqlen,
+            qkv_format="thd",
+        )
 
     tokens = tokens.unsqueeze(0)
 
@@ -152,8 +181,16 @@ def get_batch(
             loss_masks = F.pad(loss_masks, (0, pad), value=0)
         loss_masks = loss_masks.chunk(cp_size, dim=0)[cp_rank].unsqueeze(0)
     elif cp_size > 1:
-        global_loss_masks, _, mask_offsets = pad_thd_sequences_for_cp(loss_masks, 0, cp_size, tp_size)
-        assert torch.equal(mask_offsets, cu_seqlens_padded), "Loss-mask/token THD CP offsets differ"
+        global_loss_masks, _, loss_mask_cu_seqlens_padded = pad_thd_sequences_for_cp(
+            loss_masks,
+            0,
+            cp_size,
+            tp_size,
+        )
+        assert torch.equal(loss_mask_cu_seqlens_padded, cu_seqlens_padded), (
+            f"Loss mask THD CP padding metadata mismatch: "
+            f"loss_mask={loss_mask_cu_seqlens_padded.tolist()}, tokens={cu_seqlens_padded.tolist()}"
+        )
         loss_masks = global_loss_masks.index_select(0, partition_indices).unsqueeze(0)
     else:
         loss_masks = torch.cat(loss_masks)

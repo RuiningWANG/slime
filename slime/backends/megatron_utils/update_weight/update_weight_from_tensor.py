@@ -302,6 +302,8 @@ class UpdateWeightFromTensor:
             )
             if flush_cache:
                 ray.get([engine.flush_cache.remote() for engine in self.rollout_engines])
+            # Official SGLang requires one session around the complete bucket stream.
+            ray.get([engine.begin_weight_update.remote() for engine in self.rollout_engines])
             if self.quantization_config and self.quantization_config["quant_method"] in ["compressed-tensors"]:
                 post_process_weights(
                     restore_weights_before_load=True,
@@ -338,7 +340,7 @@ class UpdateWeightFromTensor:
         accelerator.ipc_collect()
         accelerator.empty_cache()
 
-        # int4/fp4 post_process
+        # Finalize all buckets before generation can resume.
         if self.rank == 0:
             if self.quantization_config and self.quantization_config["quant_method"] in ["compressed-tensors"]:
                 post_process_weights(
@@ -346,6 +348,7 @@ class UpdateWeightFromTensor:
                     post_process_quantization=True,
                     rollout_engines=self.rollout_engines,
                 )
+            ray.get([engine.end_weight_update.remote() for engine in self.rollout_engines])
             ray.get([engine.continue_generation.remote() for engine in self.rollout_engines])
         dist.barrier(group=get_gloo_group())
 

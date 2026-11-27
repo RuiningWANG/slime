@@ -1,14 +1,9 @@
-"""SGLang environment compatibility checks migrated from the PR."""
-import ast
-import os
-import re
-from pathlib import Path
+"""Allocator and port settings passed to SGLang workers."""
+
 import pytest
-ROOT = Path(__file__).resolve().parents[1]
-_source = ROOT / "slime/backends/sglang_utils/sglang_engine.py"
-_tree = ast.parse(_source.read_text())
-_tree.body = [n for n in _tree.body if getattr(n, "name", None) == "prepare_server_environment"]
-exec(compile(_tree, str(_source), "exec"))
+
+from slime.backends.sglang_utils.runtime import prepare_server_environment
+
 
 @pytest.mark.parametrize(
     "allocator,expected",

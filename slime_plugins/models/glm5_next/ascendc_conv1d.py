@@ -1,27 +1,29 @@
 """AscendC causal Conv1d forward/backward for GLM5-next training.
 
 Adapted from MindSpeed-Bridge's GLM-5.3-Flash kda_conv1d_fused.py.
-Inputs retain Slime's [B, T, C] and [C, W] contract. SiLU stays outside
-the convolution, as in the reference adapter. CP gather/scatter is owned
+Inputs retain Slime's [B, T, C] and [C, W] contract. SiLU is fused before
+the output cast, matching inference. CP gather/scatter is owned
 by npu_backend, so packed boundaries here describe complete sequences.
 """
 
-import logging
 import os
 from functools import lru_cache
 
 import torch
-import torch.nn.functional as F
 
-logger = logging.getLogger(__name__)
-_LOGGED = False
-_BACKWARD_LOGGED = False
+from .packed_sequence import packed_boundaries
 
 
 @lru_cache(maxsize=1)
 def _load_ops():
-    from fla_npu.ops.ascendc import npu_causal_conv1d, npu_causal_conv1d_bwd
-    from fla_npu.ops.ascendc._runtime import runtime
+    try:
+        from fla_npu.ops.ascendc import npu_causal_conv1d, npu_causal_conv1d_bwd
+        from fla_npu.ops.ascendc._runtime import runtime
+    except ImportError as exc:
+        raise ImportError(
+            "Conv1d requires the FLA-NPU forward and backward bindings from bde95747. "
+            "Install the wheel for your SoC with scripts/quick_install.sh --glm5.3-flash a3 (or a5)."
+        ) from exc
 
     acl = runtime()
     symbols = (
@@ -33,7 +35,7 @@ def _load_ops():
     try:
         for name in symbols:
             acl.symbol(name)
-    except AttributeError as exc:
+    except (AttributeError, OSError) as exc:
         raise RuntimeError(
             "FLA-NPU is missing the CANN causal Conv1d forward/backward operators. "
             "Install the GLM5.3Flash FLA-NPU wheel and source its vendor set_env.bash. "
@@ -44,23 +46,24 @@ def _load_ops():
 
 class _CausalConv1d(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, x, weight, boundaries):
+    def forward(ctx, x, weight, boundaries, activation_mode):
         npu_causal_conv1d, _ = _load_ops()
 
-        global _LOGGED
-        if not _LOGGED:
-            logger.info("GLM53_FUSED_CONV backend=ascendc forward_and_backward=True")
-            _LOGGED = True
         width, channels = weight.shape
         sequences = len(boundaries) - 1 if boundaries is not None else x.shape[0]
         states = x.new_zeros((sequences, width - 1, channels))
-        with torch.profiler.record_function("glm53::ascendc_causal_conv1d_forward"):
-            output = npu_causal_conv1d(
-                x=x, weight=weight, bias=None, conv_states=states,
-                query_start_loc=boundaries, activation_mode=0, run_mode=0,
-            )
+        output = npu_causal_conv1d(
+            x=x,
+            weight=weight,
+            bias=None,
+            conv_states=states,
+            query_start_loc=boundaries,
+            activation_mode=activation_mode,
+            run_mode=0,
+        )
         ctx.save_for_backward(x, weight)
         ctx.boundaries = boundaries
+        ctx.activation_mode = activation_mode
         # FLA 26.10 uses BSND for logical [B, T, C] Conv1d inputs;
         # this enum does not require reshaping them to four dimensions.
         ctx.layout = "TND" if x.ndim == 2 else "BSND"
@@ -68,20 +71,37 @@ class _CausalConv1d(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output):
-        _, npu_causal_conv1d_bwd = _load_ops()
-        global _BACKWARD_LOGGED
-        if not _BACKWARD_LOGGED:
-            logger.info("GLM53_FUSED_CONV_BACKWARD backend=ascendc")
-            _BACKWARD_LOGGED = True
+        npu_causal_conv1d, npu_causal_conv1d_bwd = _load_ops()
 
         x, weight = ctx.saved_tensors
-        with torch.profiler.record_function("glm53::ascendc_causal_conv1d_backward"):
-            dx, dw, _, _ = npu_causal_conv1d_bwd(
-                x=x, y=None, weight=weight, dy=grad_output.contiguous(),
-                initial_state=None, dht=None, query_start_loc=ctx.boundaries,
-                activation=0, input_layout=ctx.layout,
+        # CANN backward consumes the pre-SiLU value in the input dtype, not
+        # the fused output. Recompute it only for backward to avoid retaining
+        # another activation tensor throughout the forward pass.
+        pre_activation = None
+        if ctx.activation_mode:
+            sequences = len(ctx.boundaries) - 1 if ctx.boundaries is not None else x.shape[0]
+            states = x.new_zeros((sequences, weight.shape[0] - 1, weight.shape[1]))
+            pre_activation = npu_causal_conv1d(
+                x=x,
+                weight=weight,
+                bias=None,
+                conv_states=states,
+                query_start_loc=ctx.boundaries,
+                activation_mode=0,
+                run_mode=0,
             )
-        return dx, dw, None
+        dx, dw, _, _ = npu_causal_conv1d_bwd(
+            x=x,
+            y=pre_activation,
+            weight=weight,
+            dy=grad_output.contiguous(),
+            initial_state=None,
+            dht=None,
+            query_start_loc=ctx.boundaries,
+            activation=ctx.activation_mode,
+            input_layout=ctx.layout,
+        )
+        return dx, dw, None, None
 
 
 def causal_conv1d_ascendc(x, weight, activation="silu", cu_seqlens=None):
@@ -97,19 +117,13 @@ def causal_conv1d_ascendc(x, weight, activation="silu", cu_seqlens=None):
     if cu_seqlens is not None:
         if x.shape[0] != 1:
             raise ValueError("Packed AscendC Conv1d requires batch size 1")
-        values = [int(v) for v in cu_seqlens.tolist()]
-        if len(values) < 2 or values[0] != 0 or values[-1] != x.shape[1]:
-            raise ValueError("Packed boundaries must cover all input tokens")
-        if any(b < a for a, b in zip(values, values[1:])):
-            raise ValueError("Packed boundaries must be nondecreasing")
+        values = packed_boundaries(cu_seqlens, x.shape[1])
         # Empty packed sequences have no output or gradient; the kernel requires
         # strictly increasing boundaries.
         boundaries = [values[0]] + [b for a, b in zip(values, values[1:]) if b > a]
         logical_x = logical_x.squeeze(0)
     logical_weight = weight.transpose(0, 1).contiguous().to(x.dtype)
-    output = _CausalConv1d.apply(logical_x, logical_weight, boundaries)
-    if activation == "silu":
-        output = F.silu(output)
+    output = _CausalConv1d.apply(logical_x, logical_weight, boundaries, int(activation == "silu"))
     if output.ndim == 2:
         output = output.unsqueeze(0)
     return output

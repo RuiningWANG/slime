@@ -158,6 +158,8 @@ async def _abort_server_once(url: str, request_timeout: float) -> None:
 
 async def _get_server_load(url: str, request_timeout: float) -> Any:
     return await asyncio.wait_for(
+        # Current SGLang load snapshots reject the legacy ``inflight`` section;
+        # queue/core/disaggregation fields still provide the load contract.
         get(f"{url}/v1/loads?include=core,disagg,queues", timeout=request_timeout),
         timeout=request_timeout,
     )

@@ -1,6 +1,8 @@
 import logging
+import os
 import time
 import traceback
+from contextlib import nullcontext
 from pathlib import Path
 
 import torch
@@ -9,6 +11,44 @@ from slime.utils import accelerator
 from slime.utils.memory_utils import print_memory
 
 logger = logging.getLogger(__name__)
+
+
+def npu_update_profile_dir(update: int):
+    """Return the shared trace directory for the selected one-based update."""
+    root = os.environ.get("GLM53_PROFILE_DIR")
+    if root and str(update) == os.environ.get("GLM53_PROFILE_UPDATE"):
+        return Path(root) / f"update{update}"
+    return None
+
+
+def npu_train_step_profile(update: int):
+    root = npu_update_profile_dir(update)
+    if root is None:
+        return nullcontext()
+
+    from megatron.core import parallel_state as mpu
+
+    if mpu.get_pipeline_model_parallel_first_rank() != 0:
+        return nullcontext()
+
+    import torch_npu.profiler as prof
+
+    rank = torch.distributed.get_rank()
+    stage = mpu.get_pipeline_model_parallel_rank()
+    path = root / "train" / f"pp{stage}_rank{rank}"
+    path.mkdir(parents=True, exist_ok=True)
+    return prof.profile(
+        activities=[prof.ProfilerActivity.CPU, prof.ProfilerActivity.NPU],
+        on_trace_ready=prof.tensorboard_trace_handler(str(path), worker_name=f"rank{rank}"),
+        record_shapes=True,
+        profile_memory=True,
+        with_stack=False,
+        experimental_config=prof._ExperimentalConfig(
+            profiler_level=prof.ProfilerLevel.Level1,
+            aic_metrics=prof.AiCMetrics.AiCoreNone,
+            export_type="text",
+        ),
+    )
 
 
 class TrainProfiler:

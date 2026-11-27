@@ -1,18 +1,12 @@
 """NPU numerical regression tests for the GLM5-next fused causal convolution."""
 
-import importlib.util
-from pathlib import Path
-
 import pytest
 import torch
 import torch.nn.functional as F
 
 pytest.importorskip("torch_npu")
 pytestmark = pytest.mark.skipif(not torch.npu.is_available(), reason="requires an Ascend NPU")
-_path = Path(__file__).resolve().parents[1] / "slime_plugins/models/glm5_next/ascendc_conv1d.py"
-_spec = importlib.util.spec_from_file_location("glm53_conv_test", _path)
-_module = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(_module)
+from slime_plugins.models.glm5_next import ascendc_conv1d as _module
 
 
 def reference(x, weight, activation, boundaries):
@@ -55,29 +49,5 @@ def test_forward_backward(dtype, case):
     for name, a, b in [("output", actual, expect), ("dx", x.grad, xr.grad), ("dw", w.grad, wr.grad)]:
         af, bf = a.float(), b.float()
         relative_rms = ((af - bf).square().mean().sqrt() / bf.square().mean().sqrt().clamp_min(1e-8)).item()
-        print(case, dtype, name, "max_abs", (af - bf).abs().max().item(), "relative_rms", relative_rms, flush=True)
         assert torch.isfinite(a).all()
         assert relative_rms < (0.025 if dtype == torch.bfloat16 else 0.005)
-
-
-@pytest.mark.parametrize("override,expected", [(None, "ascendc"), ("ascendc", "ascendc"), ("torch", "torch")])
-def test_dispatch_without_legacy_vendor(monkeypatch, override, expected):
-    import ast
-    import os
-    import sys
-    import types
-
-    source = _path.with_name("npu_backend.py").read_text()
-    node = next(n for n in ast.parse(source).body if isinstance(n, ast.FunctionDef) and n.name == "_convolve")
-    package = "_glm53_conv_dispatch_test"
-    module = types.ModuleType(package + ".ascendc_conv1d")
-    module.causal_conv1d_ascendc = lambda *args: "ascendc"
-    monkeypatch.setitem(sys.modules, module.__name__, module)
-    monkeypatch.delenv("GLM53_CONV_BACKEND", raising=False)
-    monkeypatch.setenv("ASCEND_CUSTOM_OPP_PATH", "/fla_npu/opp/vendors/fla_npu_transformer")
-    if override is not None:
-        monkeypatch.setenv("GLM53_CONV_BACKEND", override)
-    scope = {"os": os, "torch": torch, "__package__": package, "_convolve_torch": lambda *args: "torch"}
-    exec(compile(ast.Module(body=[node], type_ignores=[]), str(_path.with_name("npu_backend.py")), "exec"), scope)
-    x = types.SimpleNamespace(device=types.SimpleNamespace(type="npu"), dtype=torch.bfloat16)
-    assert scope["_convolve"](x, None, "silu", None) == expected

@@ -14,6 +14,7 @@ post-sigmoid beta, no initial/final state.
 import os
 
 import torch
+import torch.nn.functional as F
 from torch.library import custom_op
 
 from .ascendc_fla_utils import (
@@ -22,20 +23,17 @@ from .ascendc_fla_utils import (
     input_guard,
 )
 from .ascendc_l2norm import l2norm_bwd, l2norm_fwd
-
-from fla_npu.ops.ascendc import chunk_kda_fwd as ascendc_chunk_kda_fwd
+from .packed_sequence import packed_boundaries
 
 try:
     from fla_npu.ops.ascendc import chunk_kda_bwd as ascendc_chunk_kda_bwd
+    from fla_npu.ops.ascendc import chunk_kda_fwd as ascendc_chunk_kda_fwd
 except (AttributeError, ImportError) as exc:
     raise ImportError(
-        "fla_npu does not expose chunk_kda_bwd. The installed wheel is either too "
-        "old or was built for a different SoC. Inspect the installed operators with:\n"
-        "  ls $(python -c 'import fla_npu, os; print(os.path.dirname(fla_npu.__file__))')"
-        "/opp/vendors/*/op_impl/*/ | grep chunk_kda\n"
-        "Select --glm53-kda-backend=triton to keep training on the Triton path."
+        "KDA requires the fla_npu chunk_kda_fwd and chunk_kda_bwd bindings. The wheel may be too "
+        "old or was built for a different SoC. Build FLA-NPU at bde95747 for this device with "
+        "scripts/quick_install.sh --glm5.3-flash a3 (or a5) from slime-ascend."
     ) from exc
-import torch.nn.functional as F
 
 CHUNK_SIZE = 64
 
@@ -54,7 +52,17 @@ def _chunk_kda_fwd_op(
     A_log: torch.Tensor | None,
     dt_bias: torch.Tensor | None,
     cu_seqlens: list[int] | None,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]:
     (o, _final_state, g_cumsum, Aqk, Akk, w, _u, qg, kg, v_new, h, _) = ascendc_chunk_kda_fwd(
         q,
         k,
@@ -165,7 +173,7 @@ class ChunkKDAAscendCFunction(torch.autograd.Function):
             k, k_rstd = l2norm_fwd(k)
 
         heads = q.shape[2]
-        head_chunk_size = int(os.getenv("GLM53_KDA_FWD_HEAD_CHUNK_SIZE", "4"))
+        head_chunk_size = int(os.getenv("GLM53_KDA_FWD_HEAD_CHUNK_SIZE", "64"))
         if head_chunk_size <= 0:
             raise ValueError("GLM53_KDA_FWD_HEAD_CHUNK_SIZE must be positive")
 
@@ -182,8 +190,7 @@ class ChunkKDAAscendCFunction(torch.autograd.Function):
             def head_slice(tensor, dim, start=start, end=end):
                 if tensor is None:
                     return None
-                with torch.profiler.record_function("glm53::kda_head_slice"):
-                    return tensor.narrow(dim, start, end - start).contiguous()
+                return tensor.narrow(dim, start, end - start).contiguous()
 
             chunk_outputs = _chunk_kda_fwd_op(
                 head_slice(q, 2),
@@ -196,9 +203,16 @@ class ChunkKDAAscendCFunction(torch.autograd.Function):
                 lower_bound,
                 bool(use_gate_in_kernel),
                 head_slice(A_log, 0) if use_gate_in_kernel else None,
-                dt_bias.reshape(heads, -1)[start:end].flatten().contiguous() if use_gate_in_kernel and dt_bias is not None else None,
+                dt_bias.reshape(heads, -1)[start:end].flatten().contiguous()
+                if use_gate_in_kernel and dt_bias is not None
+                else None,
                 cu_seqlens,
             )
+            # A single full-head launch already owns the final tensors. Avoid
+            # duplicating all nine intermediates solely to copy identical data.
+            if start == 0 and end == heads:
+                outputs = chunk_outputs
+                break
             if outputs is None:
                 outputs = []
                 for tensor, head_dim in zip(chunk_outputs, output_head_dims, strict=True):
@@ -245,7 +259,9 @@ class ChunkKDAAscendCFunction(torch.autograd.Function):
     @input_guard
     @autocast_custom_bwd
     def backward(ctx, do: torch.Tensor, dht: torch.Tensor):
-        (q, q_rstd, k, k_rstd, v, g_input, beta, A_log, dt_bias, g_cumsum, Aqk, Akk, w, qg, kg, v_new, h) = ctx.saved_tensors
+        (q, q_rstd, k, k_rstd, v, g_input, beta, A_log, dt_bias, g_cumsum, Aqk, Akk, w, qg, kg, v_new, h) = (
+            ctx.saved_tensors
+        )
 
         if dht is not None:
             raise RuntimeError("The fused AscendC KDA backward has no final-state gradient.")
@@ -259,7 +275,7 @@ class ChunkKDAAscendCFunction(torch.autograd.Function):
         do_h = _bsnd_to_bnsd(do)
         raw_g_h = _bsnd_to_bnsd(g_input) if ctx.use_gate_in_kernel else None
         heads = q_h.shape[1]
-        head_chunk_size = int(os.getenv("GLM53_KDA_BWD_HEAD_CHUNK_SIZE", "4"))
+        head_chunk_size = int(os.getenv("GLM53_KDA_BWD_HEAD_CHUNK_SIZE", "64"))
         if head_chunk_size <= 0:
             raise ValueError("GLM53_KDA_BWD_HEAD_CHUNK_SIZE must be positive")
 
@@ -312,6 +328,11 @@ class ChunkKDAAscendCFunction(torch.autograd.Function):
             )
             if ctx.cu_seqlens is not None:
                 chunk_result = tuple(t.unsqueeze(0) for t in chunk_result[:5]) + tuple(chunk_result[5:])
+            # Keep native gradients directly when no head assembly is needed.
+            if start == 0 and end == heads:
+                gradients = chunk_result[:5]
+                dA, dbias = chunk_result[6:8]
+                break
             if gradients is None:
                 gradients = []
                 for tensor in chunk_result[:5]:
@@ -331,7 +352,6 @@ class ChunkKDAAscendCFunction(torch.autograd.Function):
 
         assert gradients is not None
         dq_h, dk_h, dv_h, db_h, dg_h = gradients
-        dh0 = None
 
         dq, dk, dv = map(_bnsd_to_bsnd, (dq_h, dk_h, dv_h))
         db, dg = _bhs_to_bsh(db_h), _bnsd_to_bsnd(dg_h)
@@ -343,7 +363,21 @@ class ChunkKDAAscendCFunction(torch.autograd.Function):
             dk = l2norm_bwd(k, k_rstd, dk)
 
         # One gradient per positional argument of apply().
-        return (dq.to(q), dk.to(k), dv.to(v), dg.to(g_input), db.to(beta), dA, dbias, None, None, None, None, None, None)
+        return (
+            dq.to(q),
+            dk.to(k),
+            dv.to(v),
+            dg.to(g_input),
+            db.to(beta),
+            dA,
+            dbias,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
 
 
 @torch.compiler.disable
@@ -364,9 +398,9 @@ def chunk_kda_ascendc(
     **kwargs,
 ):
     if cu_seqlens is not None:
-        cu_seqlens = cu_seqlens.tolist() if isinstance(cu_seqlens, torch.Tensor) else list(cu_seqlens)
-        if q.shape[0] != 1 or len(cu_seqlens) < 2 or cu_seqlens[0] != 0 or cu_seqlens[-1] != q.shape[1]:
-            raise ValueError("Packed KDA requires batch=1 and boundaries covering all tokens.")
+        if q.shape[0] != 1:
+            raise ValueError("Packed KDA requires batch size 1.")
+        cu_seqlens = packed_boundaries(cu_seqlens, q.shape[1])
         if any(b <= a for a, b in zip(cu_seqlens, cu_seqlens[1:])):
             raise ValueError("Packed KDA requires strictly increasing boundaries.")
     if initial_state is not None:

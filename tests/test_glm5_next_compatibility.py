@@ -2,14 +2,12 @@
 
 import ast
 import builtins
-import json
-import logging
-import os
-import sys
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+
+from slime_plugins.models.glm5_next.packed_sequence import packed_boundaries
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -52,25 +50,47 @@ def test_vision_normalization_uses_framework_backend(backend, expected):
     node = next(
         node
         for node in ast.walk(tree)
-        if isinstance(node, ast.Assign)
-        and any(isinstance(t, ast.Name) and t.id == "qk_norm_eps" for t in node.targets)
+        if isinstance(node, ast.Assign) and any(isinstance(t, ast.Name) and t.id == "qk_norm_eps" for t in node.targets)
     )
     ns = dict(accelerator=SimpleNamespace(device_type=lambda: backend), config=SimpleNamespace(rms_norm_eps=1e-5))
     exec(compile(ast.Module(body=[node], type_ignores=[]), str(path), "exec"), ns)
     assert ns["qk_norm_eps"] == expected
 
 
-@pytest.mark.parametrize("boundaries", [[], [0], [0, 8, 4, 12], [1, 12], [0, 13], [0, 1.5, 12]])
+@pytest.mark.parametrize("boundaries", [[], [0], [0, 8, 4, 12], [1, 12], [0, 13], [0, 1.5, 12], [False, 12], [[0, 12]], 12])
 def test_invalid_packed_boundaries(boundaries):
-    ns = load_definitions("slime_plugins/models/glm5_next/npu_backend.py", {"_boundaries"}, {})
     with pytest.raises(ValueError):
-        ns["_boundaries"](boundaries, 12)
+        packed_boundaries(boundaries, 12)
 
 
 def test_empty_packed_sequences_preserve_token_offsets():
-    ns = load_definitions("slime_plugins/models/glm5_next/npu_backend.py", {"_boundaries"}, {})
-    assert ns["_boundaries"]([0, 0, 4, 4, 12], 12) == [0, 0, 4, 4, 12]
+    assert packed_boundaries([0, 0, 4, 4, 12], 12) == [0, 0, 4, 4, 12]
+    ns = load_definitions(
+        "slime_plugins/models/glm5_next/npu_backend.py", {"_boundaries"}, {"packed_boundaries": packed_boundaries}
+    )
     assert ns["_boundaries"](None, 12) == [0, 12]
+
+
+def test_kpool_rejects_fractional_offsets_before_kernel():
+    import torch
+    from slime_plugins.models.glm5_next.sglang_kpool import pooled_indexer_topk
+
+    q = torch.empty(3, 1, 128, dtype=torch.bfloat16)
+    k = torch.empty(3, 128, dtype=q.dtype)
+    offsets = torch.tensor([0.0, 1.5, 3.0])
+    with pytest.raises(ValueError, match="integer offsets"):
+        pooled_indexer_topk(q, k, None, None, None, offsets, 4, 2)
+
+
+def test_conv1d_missing_fla_bindings_reports_install_hint(monkeypatch):
+    import sys
+    from slime_plugins.models.glm5_next.ascendc_conv1d import _load_ops
+
+    monkeypatch.setitem(sys.modules, "fla_npu.ops.ascendc", None)
+    _load_ops.cache_clear()
+    with pytest.raises(ImportError, match="bde95747") as error:
+        _load_ops()
+    assert isinstance(error.value.__cause__, ImportError)
 
 
 def test_convolution_without_cp_context():
@@ -89,60 +109,30 @@ def test_convolution_without_cp_context():
     assert calls == [("input", "weight", "silu", None)]
 
 
+@pytest.mark.parametrize("device,dtype,expected", [("cpu", "bfloat16", False), ("npu", "float32", False), ("npu", "bfloat16", True)])
+def test_fused_mhc_requires_npu_bfloat16(device, dtype, expected):
+    import torch
+
+    ns = load_definitions("slime_plugins/models/glm5_next/ops.py", {"_use_fused_mhc"}, {"torch": torch})
+    tensor = SimpleNamespace(device=SimpleNamespace(type=device), dtype=getattr(torch, dtype))
+    assert ns["_use_fused_mhc"](tensor) is expected
 
 
-
-
-
-
-@pytest.mark.parametrize("device", ["cpu", "cuda", "npu"])
-def test_npu_mhc_setting_does_not_affect_other_devices(monkeypatch, device):
-    monkeypatch.setenv("GLM53_MHC_BACKEND", "invalid")
-    ns = load_definitions("slime_plugins/models/glm5_next/ops.py", {"_use_fused_mhc"}, dict(os=os))
-    tensor = SimpleNamespace(device=SimpleNamespace(type=device))
-    if device == "npu":
-        with pytest.raises(ValueError, match="GLM53_MHC_BACKEND"):
-            ns["_use_fused_mhc"](tensor)
+@pytest.mark.parametrize(
+    "setting,selected,direct",
+    [("npu", "npu", True), ("auto", "npu", True), (None, "npu", True), ("cuda", "cuda", False)],
+)
+def test_r3_uses_selected_accelerator(monkeypatch, setting, selected, direct):
+    if setting is None:
+        monkeypatch.delenv("SLIME_ACCELERATOR", raising=False)
     else:
-        assert ns["_use_fused_mhc"](tensor) is False
-
-
-def test_device_probe_does_not_swallow_interrupt():
-    def interrupted():
-        raise KeyboardInterrupt
-
-    import functools
-
-    ns = load_definitions(
-        "slime_plugins/models/glm5_next/ascendc_fla_utils.py",
-        {"get_available_device"},
-        dict(
-            functools=functools,
-            triton=SimpleNamespace(
-                runtime=SimpleNamespace(driver=SimpleNamespace(active=SimpleNamespace(get_current_target=interrupted)))
-            ),
-        ),
+        monkeypatch.setenv("SLIME_ACCELERATOR", setting)
+    tree = ast.parse((ROOT / "slime/rollout/sglang_rollout.py").read_text())
+    generate = next(node for node in tree.body if getattr(node, "name", None) == "generate")
+    branch = next(node for node in generate.body if isinstance(node, ast.If) and "/workers" in ast.unparse(node))
+    scope = dict(
+        accelerator=SimpleNamespace(device_type=lambda: selected), args=SimpleNamespace(use_rollout_routing_replay=True)
     )
-    with pytest.raises(KeyboardInterrupt):
-        ns["get_available_device"]()
-
-
-@pytest.mark.parametrize("device", ["cpu", "cuda", "npu"])
-def test_npu_kpool_setting_does_not_affect_other_devices(monkeypatch, device):
-    monkeypatch.setenv("GLM53_KPOOL_BACKEND", "invalid")
-    tree = ast.parse((ROOT / "slime_plugins/models/glm5_next/attention.py").read_text())
-    cls = next(node for node in tree.body if getattr(node, "name", None) == "PooledIndexer")
-    forward = next(node for node in cls.body if getattr(node, "name", None) == "forward")
-    start = next(
-        i
-        for i, node in enumerate(forward.body)
-        if isinstance(node, ast.Assign) and isinstance(node.targets[0], ast.Name) and node.targets[0].id == "backend"
-    )
-    code = compile(ast.Module(body=forward.body[start : start + 2], type_ignores=[]), "kpool_selection", "exec")
-    ns = dict(os=os, x=SimpleNamespace(device=SimpleNamespace(type=device)))
-    if device == "npu":
-        with pytest.raises(ValueError, match="GLM53_KPOOL_BACKEND"):
-            exec(code, ns)
-    else:
-        exec(code, ns)
-        assert ns["backend"] == "torch"
+    assert eval(compile(ast.Expression(branch.test), "<r3>", "eval"), scope) is direct
+    scope["args"].use_rollout_routing_replay = False
+    assert not eval(compile(ast.Expression(branch.test), "<r3>", "eval"), scope)

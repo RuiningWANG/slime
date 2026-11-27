@@ -577,13 +577,6 @@ class MegatronTrainRayActor(TrainRayActor):
 
         if self.args.use_rollout_routing_replay:
             RoutingReplay.assert_all_consumed()
-            logger.info(
-                "ROUTING_REPLAY_VERIFIED rollout=%s rank=%s routers=%s recorded=%s forward=%s backward=%s",
-                rollout_id, torch.distributed.get_rank(), len(RoutingReplay.all_routing_replays),
-                sum(len(r.top_indices_list) for r in RoutingReplay.all_routing_replays),
-                sum(r.forward_index for r in RoutingReplay.all_routing_replays),
-                sum(r.backward_index for r in RoutingReplay.all_routing_replays),
-            )
 
         if self.args.use_routing_replay:
             RoutingReplay.clear_all()

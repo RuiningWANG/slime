@@ -14,6 +14,8 @@ import triton.language as tl
 
 from .ascendc_fla_utils import autotune_cache_kwargs, input_guard
 
+# Tune BT once per feature dimension and dtype, then reuse it across lengths.
+# T stays dynamic; a length bucket must not create identical compiled kernels.
 BT_LIST = [8, 16, 32, 64, 128]
 
 
@@ -76,7 +78,7 @@ def l2norm_bwd_kernel1(
 
 @triton.autotune(
     configs=[triton.Config({"BT": BT}) for BT in BT_LIST],
-    key=["D", "NB"],
+    key=["D"],
     **autotune_cache_kwargs,
 )
 @triton.jit(do_not_specialize=["T"])
@@ -88,7 +90,6 @@ def l2norm_fwd_kernel(
     T,
     D: tl.constexpr,
     BD: tl.constexpr,
-    NB: tl.constexpr,
     BT: tl.constexpr,
 ):
     i_t = tl.program_id(0)
@@ -106,7 +107,7 @@ def l2norm_fwd_kernel(
 
 @triton.autotune(
     configs=[triton.Config({"BT": BT}) for BT in BT_LIST],
-    key=["D", "NB"],
+    key=["D"],
     **autotune_cache_kwargs,
 )
 @triton.jit(do_not_specialize=["T"])
@@ -119,7 +120,6 @@ def l2norm_bwd_kernel(
     T,
     D: tl.constexpr,
     BD: tl.constexpr,
-    NB: tl.constexpr,
     BT: tl.constexpr,
 ):
     i_t = tl.program_id(0)
@@ -157,7 +157,6 @@ def l2norm_fwd(
 
     rstd = torch.empty((T,), dtype=torch.float32, device=x.device)
     if D <= 512:
-        NB = triton.cdiv(T, 2048 * 32)
 
         def grid(meta):
             return (triton.cdiv(T, meta["BT"]),)
@@ -170,7 +169,6 @@ def l2norm_fwd(
             T=T,
             D=D,
             BD=BD,
-            NB=NB,
         )
     else:
         l2norm_fwd_kernel1[(T,)](
@@ -204,7 +202,6 @@ def l2norm_bwd(
         raise RuntimeError("This layer norm doesn't support feature dim >= 64KB.")
 
     if D <= 512:
-        NB = triton.cdiv(T, 2048 * 32)
 
         def grid(meta):
             return (triton.cdiv(T, meta["BT"]),)
@@ -218,7 +215,6 @@ def l2norm_bwd(
             T=T,
             D=D,
             BD=BD,
-            NB=NB,
         )
     else:
         l2norm_bwd_kernel1[(T,)](
