@@ -1,8 +1,6 @@
 import logging
-import os
 import time
 import traceback
-from contextlib import nullcontext
 from pathlib import Path
 
 import torch
@@ -13,51 +11,19 @@ from slime.utils.memory_utils import print_memory
 logger = logging.getLogger(__name__)
 
 
-def npu_update_profile_dir(update: int):
-    """Return the shared trace directory for the selected one-based update."""
-    root = os.environ.get("GLM53_PROFILE_DIR")
-    if root and str(update) == os.environ.get("GLM53_PROFILE_UPDATE"):
-        return Path(root) / f"update{update}"
-    return None
-
-
-def npu_train_step_profile(update: int):
-    root = npu_update_profile_dir(update)
-    if root is None:
-        return nullcontext()
-
-    from megatron.core import parallel_state as mpu
-
-    if mpu.get_pipeline_model_parallel_first_rank() != 0:
-        return nullcontext()
-
-    import torch_npu.profiler as prof
-
-    rank = torch.distributed.get_rank()
-    stage = mpu.get_pipeline_model_parallel_rank()
-    path = root / "train" / f"pp{stage}_rank{rank}"
-    path.mkdir(parents=True, exist_ok=True)
-    return prof.profile(
-        activities=[prof.ProfilerActivity.CPU, prof.ProfilerActivity.NPU],
-        on_trace_ready=prof.tensorboard_trace_handler(str(path), worker_name=f"rank{rank}"),
-        record_shapes=True,
-        profile_memory=True,
-        with_stack=False,
-        experimental_config=prof._ExperimentalConfig(
-            profiler_level=prof.ProfilerLevel.Level1,
-            aic_metrics=prof.AiCMetrics.AiCoreNone,
-            export_type="text",
-        ),
-    )
-
-
 class TrainProfiler:
     def __init__(self, args):
         self.args = args
         self._torch_profiler_overall = None
         self._memory_profiler_overall = None
 
-        if args.use_pytorch_profiler:
+        profile_ranks = getattr(args, "profile_ranks", None)
+        selected_rank = (
+            not profile_ranks
+            or -1 in profile_ranks
+            or torch.distributed.get_rank() in profile_ranks
+        )
+        if args.use_pytorch_profiler and selected_rank:
             self._torch_profiler_overall = _create_torch_profiler(args, name="train_overall")
 
         if args.record_memory_history:
@@ -81,6 +47,37 @@ class TrainProfiler:
 
 
 def _create_torch_profiler(args, name):
+    if accelerator.device_type() == "npu":
+        import torch_npu
+
+        # Use the native Ascend profiler so NPU kernels are collected even when
+        # torch.profiler has not been redirected by transfer_to_npu.
+        return torch_npu.profiler.profile(
+            activities=[
+                torch_npu.profiler.ProfilerActivity.CPU,
+                torch_npu.profiler.ProfilerActivity.NPU,
+            ],
+            schedule=torch_npu.profiler.schedule(
+                wait=max(args.profile_step_start - 1, 0),
+                warmup=1 if args.profile_step_start > 0 else 0,
+                active=args.profile_step_end - args.profile_step_start,
+                repeat=1,
+            ),
+            on_trace_ready=torch_npu.profiler.tensorboard_trace_handler(
+                args.tensorboard_dir,
+                worker_name=f"{name}_rank_{torch.distributed.get_rank()}",
+                async_mode=True,
+            ),
+            record_shapes=True,
+            with_stack=True,
+            profile_memory=False,
+            experimental_config=torch_npu.profiler._ExperimentalConfig(
+                profiler_level=torch_npu.profiler.ProfilerLevel.Level1,
+                export_type=torch_npu.profiler.ExportType.Text,
+                aic_metrics=torch_npu.profiler.AiCMetrics.PipeUtilization,
+            ),
+        )
+
     activities = [torch.profiler.ProfilerActivity.CPU]
     activity_name = accelerator.device_type().upper()
     if hasattr(torch.profiler.ProfilerActivity, activity_name):

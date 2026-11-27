@@ -2,7 +2,6 @@ import itertools
 import logging
 import time
 import uuid
-from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -12,7 +11,6 @@ from slime.data.batch_builder import BatchBuilder
 from slime.data.transport import DiskPayloadRef, accept_raw_rollout, check_rollout_storage, load_rollout_samples
 from slime.observability import logging_utils
 from slime.observability.logging_utils import configure_logger, init_tracking
-from slime.observability.profile_utils import npu_update_profile_dir
 from slime.observability.rollout_data_utils import (
     load_debug_rollout_data,
     save_debug_rollout_data,
@@ -337,34 +335,6 @@ class RolloutManager:
             self.servers = ray.get(self.serving.finish_rollout.remote())
         return result
 
-    @contextmanager
-    def _profile_rollout(self, rollout_id):
-        directory = npu_update_profile_dir(rollout_id + 1)
-        if directory is None:
-            yield
-            return
-
-        engine = self._get_updatable_server().engines[0]
-        ray.get(engine.start_profile.remote(
-            output_dir=str(directory / "rollout" / "engine0_tp0"),
-            activities=["CPU", "GPU"],
-            profile_by_stage=True,
-            num_steps=8,
-            npu_profile_tp_rank=0,
-            record_shapes=True,
-            with_stack=False,
-        ))
-        try:
-            yield
-        except BaseException:
-            try:
-                ray.get(engine.stop_profile.remote())
-            except Exception:
-                logger.exception("Failed to stop profiling after rollout %s failed", rollout_id)
-            raise
-        else:
-            ray.get(engine.stop_profile.remote())
-
     def _generate(self, rollout_id, start_time):
         if self.recovery is not None and rollout_id in self.recovery.batches:
             batch = self.recovery.batches[rollout_id]
@@ -385,8 +355,7 @@ class RolloutManager:
             if self.args.rollout_data_transport == "straw":
                 self.batch_builder.raw_ref = batch.raw
         else:
-            with self._profile_rollout(rollout_id):
-                data, metrics = self._get_rollout_data(rollout_id=rollout_id)
+            data, metrics = self._get_rollout_data(rollout_id=rollout_id)
             save_debug_rollout_data(
                 self.args.save_debug_rollout_data,
                 data,

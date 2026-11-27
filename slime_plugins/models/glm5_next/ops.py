@@ -1,5 +1,7 @@
 """Differentiable GLM-5.3 Flash operations (mcore_vlm-slime conventions)."""
 
+from glm53_zero_mismatch import enabled as zero_mismatch_enabled
+
 import torch
 import torch.nn.functional as F
 
@@ -8,6 +10,11 @@ from .packed_sequence import packed_boundaries
 
 def swiglu_with_limit(x, limit):
     """Clamped SwiGLU with FP32 arithmetic and the original output dtype."""
+    if zero_mismatch_enabled() and x.device.type == "npu" and x.dtype == torch.bfloat16 and x.numel():
+        import torch_npu
+
+        gate, up = x.chunk(2, dim=-1)
+        return torch_npu.npu_swiglu(torch.cat((gate.clamp(max=limit), up.clamp(-limit, limit)), dim=-1))
     gate, up = x.float().chunk(2, dim=-1)
     gate = gate.clamp(max=limit)
     up = up.clamp(-limit, limit)

@@ -29,7 +29,6 @@ try:
 except ImportError:
     from megatron.core.utils import unwrap_model
 from slime.observability import logging_utils, train_metric_utils
-from slime.observability.profile_utils import npu_train_step_profile
 from slime.utils import accelerator
 from slime.utils.memory_utils import clear_memory
 
@@ -862,19 +861,18 @@ def train(
     for step_id in range(num_steps_per_rollout):
 
         # Run training step.
-        with npu_train_step_profile(rollout_id * num_steps_per_rollout + step_id + 1):
-            loss_dict, grad_norm = train_one_step(
-                args,
-                rollout_id,
-                step_id,
-                data_iterator,
-                model,
-                optimizer,
-                opt_param_scheduler,
-                num_microbatches[step_id],
-                global_batch_sizes[step_id],
-                microbatch_pbar=microbatch_pbar,
-            )
+        loss_dict, grad_norm = train_one_step(
+            args,
+            rollout_id,
+            step_id,
+            data_iterator,
+            model,
+            optimizer,
+            opt_param_scheduler,
+            num_microbatches[step_id],
+            global_batch_sizes[step_id],
+            microbatch_pbar=microbatch_pbar,
+        )
 
         if step_id == 0:
             # Enable forward pre-hook after training step has successfully run. All subsequent
