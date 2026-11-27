@@ -46,6 +46,18 @@ def get_base_gpu_id(args, rank):
     return start_index
 
 
+def _needs_npu_metadata_sync(server_args) -> bool:
+    """Attention DP is independent from the model-replica dp_size."""
+    def field(name, default=None):
+        if isinstance(server_args, dict):
+            return server_args.get(name, default)
+        return getattr(server_args, name, default)
+
+    return field("device") == "npu" and max(
+        field("dp_size", 1) or 1, field("attn_dp_size", 1) or 1
+    ) > 1
+
+
 def launch_server_process(server_args: ServerArgs) -> multiprocessing.Process:
     # Expandable segments help the colocated training actor tolerate repeated
     # cache releases, but SGLang's allocator/sleep path does not support them.
@@ -79,7 +91,7 @@ def launch_server_process(server_args: ServerArgs) -> multiprocessing.Process:
         base_url=server_args.url(),
         api_key=server_args.api_key,
         is_process_alive=lambda: p.is_alive(),
-        wait_for_metadata=(server_args.device == "npu" and server_args.dp_size > 1),
+        wait_for_metadata=_needs_npu_metadata_sync(server_args),
     )
 
     return p
@@ -254,6 +266,7 @@ class SGLangEngine(RayActor):
                     base_url=f"http://{self.server_host}:{self.server_port}",
                     api_key=server_args_dict.get("api_key"),
                     is_process_alive=lambda: self.process.poll() is None,
+                    wait_for_metadata=_needs_npu_metadata_sync(server_args_dict),
                 )
         else:
             self.process = launch_server_process(ServerArgs(**server_args_dict))
@@ -282,7 +295,7 @@ class SGLangEngine(RayActor):
                 json=payload,
             )
             response.raise_for_status()
-            if server_args_dict.get("device") == "npu" and server_args_dict.get("dp_size", 1) > 1:
+            if _needs_npu_metadata_sync(server_args_dict):
                 # POST may only enqueue registration. Finish before later model
                 # operations can block the router's metadata request again.
                 deadline = time.monotonic() + 60
@@ -610,7 +623,6 @@ class SGLangEngine(RayActor):
         profile_by_stage: bool = False,
         with_stack: bool | None = None,
         record_shapes: bool | None = None,
-        npu_profile_tp_rank: int | None = None,
     ):
         if self.node_rank != 0:
             return
@@ -625,7 +637,6 @@ class SGLangEngine(RayActor):
                 "profile_by_stage": profile_by_stage,
                 "with_stack": with_stack,
                 "record_shapes": record_shapes,
-                "npu_profile_tp_rank": npu_profile_tp_rank,
             },
         )
         response.raise_for_status()

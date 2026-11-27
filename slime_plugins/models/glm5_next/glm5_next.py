@@ -1,5 +1,7 @@
 """GLM-5.3 Flash spec for upstream Megatron, following the GLM5 plugin API."""
 
+from glm53_zero_mismatch import enabled as zero_mismatch_enabled
+
 import copy
 import os
 
@@ -26,7 +28,7 @@ class Glm5NextLayer(TransformerLayer):
     def __init__(self, *args, hf_config, **kwargs):
         super().__init__(*args, **kwargs)
         self.hf_config = hf_config
-        if hasattr(self.mlp, "experts"):
+        if hasattr(self.mlp, "experts") and not zero_mismatch_enabled():
             if accelerator.device_type() == "npu" and not getattr(hf_config, "router_fp32", False):
                 from .router import install_inference_aligned_router
 
@@ -96,7 +98,12 @@ class Glm5NextLayer(TransformerLayer):
                 output = output + bias
             hidden_states = mhc_post(output, hidden_states, post, residual)
         if self.layer_number == self.config.num_layers:
-            hidden_states = hidden_states.unflatten(-1, (config.hc_mult, -1)).float().mean(-2).to(hidden_states.dtype)
+            if zero_mismatch_enabled():
+                from .zero_mismatch.final_mean import final_stream_mean
+
+                hidden_states = final_stream_mean(hidden_states, config.hc_mult)
+            else:
+                hidden_states = hidden_states.unflatten(-1, (config.hc_mult, -1)).float().mean(-2).to(hidden_states.dtype)
         return hidden_states, context
 
 
@@ -116,6 +123,12 @@ def get_glm5_next_spec(args, config, vp_stage):
         raise ValueError("GLM5-next native attention requires TP=1; use CP, PP and EP to shard the 300B model")
     if config.context_parallel_size > 1 and not args.allgather_cp:
         raise ValueError("GLM5-next CP>1 requires --allgather-cp for contiguous KDA sequence partitions")
+    if zero_mismatch_enabled() and (
+        config.context_parallel_size != 1
+        or config.expert_model_parallel_size != 16
+        or config.num_moe_experts != 288
+    ):
+        raise ValueError("The aligned full-model recipe requires CP1, EP16 and 288 experts")
     config.activation_func_clamp_value = hf_config.swiglu_limit
     config.bias_activation_fusion = False
     config.use_te_activation_func = True
@@ -146,5 +159,9 @@ def get_glm5_next_spec(args, config, vp_stage):
             moe_grouped_gemm=config.moe_grouped_gemm,
             use_te_activation_func=True,
         )
+        if zero_mismatch_enabled() and layer_id >= hf_config.first_k_dense_replace:
+            from .moe_chunking import aligned_moe_builder
+
+            layer.submodules.mlp = aligned_moe_builder(layer.submodules.mlp)
         spec.layer_specs[index] = layer
     return spec

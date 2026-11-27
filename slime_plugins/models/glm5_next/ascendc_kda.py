@@ -173,7 +173,7 @@ class ChunkKDAAscendCFunction(torch.autograd.Function):
             k, k_rstd = l2norm_fwd(k)
 
         heads = q.shape[2]
-        head_chunk_size = int(os.getenv("GLM53_KDA_FWD_HEAD_CHUNK_SIZE", "64"))
+        head_chunk_size = int(os.getenv("GLM53_KDA_FWD_HEAD_CHUNK_SIZE", "4"))
         if head_chunk_size <= 0:
             raise ValueError("GLM53_KDA_FWD_HEAD_CHUNK_SIZE must be positive")
 
@@ -275,7 +275,7 @@ class ChunkKDAAscendCFunction(torch.autograd.Function):
         do_h = _bsnd_to_bnsd(do)
         raw_g_h = _bsnd_to_bnsd(g_input) if ctx.use_gate_in_kernel else None
         heads = q_h.shape[1]
-        head_chunk_size = int(os.getenv("GLM53_KDA_BWD_HEAD_CHUNK_SIZE", "64"))
+        head_chunk_size = int(os.getenv("GLM53_KDA_BWD_HEAD_CHUNK_SIZE", "4"))
         if head_chunk_size <= 0:
             raise ValueError("GLM53_KDA_BWD_HEAD_CHUNK_SIZE must be positive")
 

@@ -1,5 +1,7 @@
 """Checkpoint-compatible CogViT using the Transformers GLM-OCR building blocks."""
 
+from glm53_zero_mismatch import enabled as zero_mismatch_enabled
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -11,6 +13,7 @@ from transformers.models.glm_ocr.modeling_glm_ocr import (
     GlmOcrVisionModel,
     GlmOcrVisionPatchEmbed,
     GlmOcrVisionPatchMerger,
+    GlmOcrVisionRotaryEmbedding,
 )
 
 from .attention import RMSNorm
@@ -58,7 +61,14 @@ class Glm5NextVisionBlock(GlmOcrVisionBlock):
         if hidden_states.device.type == "npu":
             import torch_npu
 
-            normalized, _, residual = torch_npu.npu_add_rms_norm(
+            add_rms_norm = torch_npu.npu_add_rms_norm
+            if zero_mismatch_enabled():
+                from sglang.srt.hardware_backend.npu.batch_invariant_ops.npu_batch_invariant_ops import (
+                    npu_add_rms_norm_batch_invariant,
+                )
+
+                add_rms_norm = npu_add_rms_norm_batch_invariant
+            normalized, _, residual = add_rms_norm(
                 hidden_states, attention, self.norm2.weight, self.norm2.eps
             )
             return residual + self.mlp(normalized)
@@ -143,6 +153,44 @@ class Glm5NextPatchEmbed(GlmOcrVisionPatchEmbed):
         return F.linear(patches, self.proj.weight.flatten(1), self.proj.bias)
 
 
+class Glm5NextVisionRotaryEmbedding(GlmOcrVisionRotaryEmbedding):
+    """Use the serving RoPE table for the BF16 NPU training forward."""
+
+    def __init__(self, config):
+        super().__init__(config)
+        self.register_buffer("_serving_cache", None, persistent=False)
+
+    def _apply(self, fn, recurse=True):
+        self._serving_cache = None
+        return super()._apply(fn, recurse=recurse)
+
+    @torch.no_grad()
+    def forward(self, x, position_ids):
+        if x.device.type != "npu" or x.dtype != torch.bfloat16 or not zero_mismatch_enabled():
+            return super().forward(x, position_ids)
+
+        if self._serving_cache is None:
+            from sglang.srt.layers.rotary_embedding.base import RotaryEmbedding
+
+            # Match Glm5NextVisionModel in SGLang: compute the full FP32
+            # table on the target NPU, then round to the activation dtype.
+            # A private buffer avoids sharing state with another model.
+            head_dim = x.shape[-1] // self.config.num_attention_heads
+            with torch.device(x.device):
+                rope = RotaryEmbedding(
+                    head_size=head_dim,
+                    rotary_dim=head_dim // 2,
+                    max_position_embeddings=8192,
+                    base=10000.0,
+                    is_neox_style=True,
+                    dtype=x.dtype,
+                )
+            self._serving_cache = rope.cos_sin_cache.to(x.dtype)
+
+        cos, sin = self._serving_cache[position_ids.to(x.device)].chunk(2, dim=-1)
+        return self.recomposition_frequencies(cos), self.recomposition_frequencies(sin)
+
+
 class Glm5NextVisionModel(GlmOcrVisionModel):
     def __init__(self, config):
         if accelerator.device_type() == "npu":
@@ -154,6 +202,7 @@ class Glm5NextVisionModel(GlmOcrVisionModel):
         self.post_layernorm = Glm5NextVisionRMSNorm(config.hidden_size, config.rms_norm_eps)
         if accelerator.device_type() == "npu":
             # Use one FP32 frequency table regardless of the construction device.
+            self.rotary_pos_emb = Glm5NextVisionRotaryEmbedding(config)
             rotary = self.rotary_pos_emb
             with torch.device("cpu"):
                 inv_freq, _ = rotary.compute_axial_rope_parameters(rotary.config, device="cpu")

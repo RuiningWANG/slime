@@ -1,5 +1,7 @@
 """GLM-5.3 Flash KDA and no-RoPE MLA with pooled DSA indexing."""
 
+from glm53_zero_mismatch import enabled as zero_mismatch_enabled
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -65,7 +67,12 @@ class KimiDeltaAttention(nn.Module):
         self.b_proj = nn.Linear(hidden, self.heads, bias=False)
         self.A_log = nn.Parameter(torch.zeros(self.heads, dtype=torch.float32))
         self.dt_bias = nn.Parameter(torch.zeros(width, dtype=torch.float32))
-        self.o_norm = FusedRMSNormGated(self.head_dim, eps=hf_config.rms_norm_eps, activation="sigmoid")
+        norm_class = FusedRMSNormGated
+        if accelerator.device_type() == "npu" and zero_mismatch_enabled():
+            from .zero_mismatch.kda import SharedGatedNorm
+
+            norm_class = SharedGatedNorm
+        self.o_norm = norm_class(self.head_dim, eps=hf_config.rms_norm_eps, activation="sigmoid")
         self.o_proj = nn.Linear(width, hidden, bias=False)
 
     def _apply(self, fn, recurse=True):
@@ -81,26 +88,38 @@ class KimiDeltaAttention(nn.Module):
         if self.cp_group is not None and self.cp_group.size() > 1:
             # --allgather-cp partitions the packed stream into contiguous intervals.
             cp_context = build_cp_context(cu, self.cp_group, conv1d_kernel_size=self.q_conv1d.kernel_size[0])
-        qkv = []
-        for name in ("q", "k", "v"):
-            projected = getattr(self, f"{name}_proj")(x)
-            conv = getattr(self, f"{name}_conv1d")
-            if cp_context is None:
-                convolved, _ = conv(projected, cu_seqlens=cu)
-            else:
-                convolved, _ = causal_conv1d(
-                    projected, conv.weight.squeeze(1), activation=conv.activation, cp_context=cp_context
-                )
-            qkv.append(convolved.unflatten(-1, (self.heads, self.head_dim)))
-        gate = self.f_b_proj(self.f_a_proj(x)).unflatten(-1, (self.heads, self.head_dim))
-        beta_logits = self.b_proj(x)
+        aligned_kda = x.device.type == "npu" and zero_mismatch_enabled()
+        if aligned_kda:
+            from .zero_mismatch.kda import shared_kda
+            from .zero_mismatch.kda_inputs import project_and_convolve
+
+            qkv, gate, beta_logits, norm_gate = project_and_convolve(
+                self, x, cu, getattr(packed_seq_params, "cu_seqlens_q_cpu", None), cp_context
+            )
+            run_kda = shared_kda
+        else:
+            qkv = []
+            for name in ("q", "k", "v"):
+                projected = getattr(self, f"{name}_proj")(x)
+                conv = getattr(self, f"{name}_conv1d")
+                if cp_context is None:
+                    convolved, _ = conv(projected, cu_seqlens=cu)
+                else:
+                    convolved, _ = causal_conv1d(
+                        projected, conv.weight.squeeze(1), activation=conv.activation, cp_context=cp_context
+                    )
+                qkv.append(convolved.unflatten(-1, (self.heads, self.head_dim)))
+            gate = self.f_b_proj(self.f_a_proj(x)).unflatten(-1, (self.heads, self.head_dim))
+            beta_logits = self.b_proj(x)
+            norm_gate = self.g_b_proj(self.g_a_proj(x))
+            run_kda = chunk_kda
         # Ascend inference computes beta sigmoid in FP32 in prefill and decode.
         beta = (
             beta_logits.float().sigmoid()
             if x.device.type == "npu"
             else beta_logits.sigmoid()
         )
-        output, _ = chunk_kda(
+        output, _ = run_kda(
             *qkv,
             g=gate,
             beta=beta,
@@ -114,8 +133,9 @@ class KimiDeltaAttention(nn.Module):
             cp_context=cp_context,
             **({"cu_seqlens_cpu": getattr(packed_seq_params, "cu_seqlens_q_cpu", None)}
                if accelerator.device_type() == "npu" else {}),
+            **({"raw_beta": beta_logits} if aligned_kda else {}),
         )
-        output_gate = self.g_b_proj(self.g_a_proj(x)).reshape(-1, self.head_dim)
+        output_gate = norm_gate.reshape(-1, self.head_dim)
         output = self.o_norm(output.reshape(-1, self.head_dim), output_gate).reshape(
             *x.shape[:-1], self.heads * self.head_dim
         )
@@ -141,23 +161,36 @@ class PooledIndexer(nn.Module):
     def forward(self, x, q, packed_seq_params, cp_group):
         # MLA-noPE also disables indexer RoPE. The checkpoint already uses
         # SGLang/HF's channel order, so no half-channel permutation is needed.
-        index_q = self.wq_b(q).view(-1, self.heads, self.dim)
-        projected_key = self.wk(x)
-        weights = F.linear(x.float(), self.weights_proj.weight.float())
-        if x.device.type == "npu":
+        if x.device.type == "npu" and x.dtype == torch.bfloat16 and zero_mismatch_enabled():
+            from sglang.srt.zero_mismatch.indexer import project_rows, project_head_weights
             from .sglang_kpool import pooled_indexer_topk as select_indices
 
+            index_q = project_rows(q, self.wq_b.weight).view(-1, self.heads, self.dim)
+            projected_key = project_rows(x, self.wk.weight)
             index_k = F.layer_norm(
                 projected_key.float(), (self.dim,), self.k_norm.weight.float(),
                 self.k_norm.bias.float(), self.k_norm.eps,
             ).to(projected_key.dtype)
-            # SGLang rounds head-scaled weights before the kernel applies the dimension scale.
-            weights = (weights * self.heads ** -0.5).to(torch.bfloat16)
+            gates = project_rows(x, self.index_kpool_compress_gate)
+            weights = project_head_weights(x, self.weights_proj.weight, self.heads)
         else:
-            select_indices = pooled_indexer_topk
-            index_k = self.k_norm(projected_key)
-            weights = weights * (self.heads * self.dim) ** -0.5
-        gates = F.linear(x, self.index_kpool_compress_gate)
+            index_q = self.wq_b(q).view(-1, self.heads, self.dim)
+            projected_key = self.wk(x)
+            weights = F.linear(x.float(), self.weights_proj.weight.float())
+            if x.device.type == "npu":
+                from .sglang_kpool import pooled_indexer_topk as select_indices
+
+                index_k = F.layer_norm(
+                    projected_key.float(), (self.dim,), self.k_norm.weight.float(),
+                    self.k_norm.bias.float(), self.k_norm.eps,
+                ).to(projected_key.dtype)
+                # SGLang rounds head-scaled weights before the kernel applies the dimension scale.
+                weights = (weights * self.heads ** -0.5).to(torch.bfloat16)
+            else:
+                select_indices = pooled_indexer_topk
+                index_k = self.k_norm(projected_key)
+                weights = weights * (self.heads * self.dim) ** -0.5
+            gates = F.linear(x, self.index_kpool_compress_gate)
         cp_size = cp_group.size() if cp_group is not None else 1
         cp_rank = cp_group.rank() if cp_group is not None else 0
         if cp_size > 1:
@@ -219,7 +252,19 @@ class NopeDSAttention(nn.Module):
         if q.device.type == "npu":
             from .ascendc_sparse_attention import sparse_attention
 
-            out = sparse_attention(q, kv[:, None], indices, self.qk_dim**-0.5)
+            if zero_mismatch_enabled():
+                from .zero_mismatch.sparse_attention import training_sparse_attention
+
+                def native_attention(q, kv, indices, scale):
+                    return sparse_attention(q, kv, indices, scale), None
+
+                out, _ = training_sparse_attention(
+                    q, kv[:, None], indices, self.qk_dim**-0.5, packed_seq_params,
+                    self.cp_group, self.indexer.topk + self.indexer.pool_size - 1,
+                    native=native_attention,
+                )
+            else:
+                out = sparse_attention(q, kv[:, None], indices, self.qk_dim**-0.5)
         else:
             # Preserve the original GPU SparseMLA 512+64 layout.
             out, _ = SparseMLA.apply(F.pad(q, (0, 64)), F.pad(kv[:, None], (0, 64)), indices, self.qk_dim**-0.5)

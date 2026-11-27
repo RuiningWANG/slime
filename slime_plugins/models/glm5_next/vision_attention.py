@@ -1,5 +1,7 @@
 """Inference-aligned visual attention with an explicit training backward."""
 
+from glm53_zero_mismatch import enabled as zero_mismatch_enabled
+
 import torch
 import torch.nn.functional as F
 from torch.autograd.function import once_differentiable
@@ -16,7 +18,16 @@ class _VisionFIA(torch.autograd.Function):
     def forward(ctx, q, k, v, ends, scale):
         import torch_npu
 
-        output = torch_npu.npu_fused_infer_attention_score(
+        fia = torch_npu.npu_fused_infer_attention_score
+        if zero_mismatch_enabled() and q.dtype == torch.bfloat16:
+            # Serving enables BI FIA process-wide. Select it only for this
+            # training forward so other training operators keep their dispatch.
+            from sglang.srt.hardware_backend.npu.batch_invariant_ops.npu_batch_invariant_ops import (
+                npu_fused_infer_attention_score_batch_invariant,
+            )
+
+            fia = npu_fused_infer_attention_score_batch_invariant
+        output = fia(
             query=q,
             key=k,
             value=v,
